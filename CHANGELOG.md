@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.4.0 — 2026-07-15
+
+Reliability release driven by a 16-scenario live battery against the real
+7B model (5 of 16 runs previously reported success for broken or missing
+code; all 5 are fixed or now fail honestly).
+
+- Smoke-run verification: when a single Python file changed and no test
+  setup exists, the harness now RUNS it with dummy piped input (10s cap)
+  after the syntax check. Syntax-valid code that crashes on execution no
+  longer counts as verified; the traceback feeds the repair loop.
+- Empty-project fallback: a filename-less fence with a known language now
+  targets a conventional new file (main.py, main.c, …) when the project
+  has no file of that language — the model's first, usually best, reply
+  was previously dropped and the nudged retry was usually worse.
+- Requested-function acceptance: when the request spells out a function
+  ("add is_even(n)"), an auto run that never defines it is nudged and, if
+  it still doesn't comply, ends requirements-unmet instead of "completed".
+- Merge now appends a definitions-only proposal that overlaps nothing in
+  the target file ("add a function" answered with only that function) —
+  previously it became a whole-file overwrite that the definition-removal
+  guard refused, dead-ending the request.
+- Rename requests ("rename add to sum_two", "rinomina") are recognized as
+  authorizing removal of the renamed definition.
+- One transient model failure (e.g. a 60s timeout) no longer kills the
+  whole run — the request is retried once.
+- The model-response timeout is now an INACTIVITY bound (no bytes for 60s)
+  instead of a whole-response cap, so a slow 7B that keeps streaming a long
+  file is no longer killed mid-generation.
+- Plain `def test_*` files are executed with a minimal built-in runner when
+  pytest is not installed — previously they were only syntax-checked, so
+  "fix the bug so the tests pass" could never establish a failing baseline
+  or verify the fix on machines without pytest.
+- Partial-write merges protect existing functions the request never
+  mentions: "add is_even(n)" no longer lets the model silently rewrite
+  double()'s body in the same fence.
+- Requests that ask for a user-input program ("Chiedi all'utente…", "Ask
+  the user…") are checked for an actual input() call in the changed files;
+  a run that regurgitated unrelated code fails as requirements-unmet
+  instead of passing on a syntax check.
+- A print-something program that runs but prints NOTHING (typically main()
+  defined and never called) now fails its smoke run with guidance, instead
+  of counting as verified.
+- One fence packing several files behind bare marker comments
+  (`# test_calc.py`) is split into separate Writes, so test code no longer
+  gets merged into the source file.
+- Prompt hardening: the model is told it cannot refuse ordinary scripts,
+  must not reference buttons/panels ("Show Code"), and must emit file
+  contents directly instead of code that opens the target file itself.
+
+## 0.3.4 — 2026-07-15
+
+- Add `/copy`: copies the newest code block from the conversation to the
+  system clipboard — the raw code, without the rendered gutter or the
+  language label. `/copy 2` reaches one block further back. (Terminal
+  selection always copies screen glyphs, gutter included; `/copy` is the
+  clean path.)
+
+## 0.3.3 — 2026-07-15
+
+- Assisted mode now proposes a Write for filename-less code fences even
+  when several project files match the fence language, targeting the top
+  relevance-ranked candidate — the approval prompt (with diff preview)
+  stays the safety gate. Auto mode keeps requiring a unique match. This
+  fixes "⚠ no applicable change was produced" dead ends when the model
+  answers with a bare ```python block in a project with several .py files.
+- Only unwrap a whole-reply ```markdown fence when other fences nest
+  inside it; a single plain ```markdown block is kept for the Write
+  fallback's language sniffing.
+- Tell the model it has real file access and must not refuse ordinary
+  scripts (dates, times, file I/O) or claim it "cannot modify live files".
+
 ## 0.3.2 — 2026-07-15
 
 - In-line cursor editing in the TUI input: ←/→ move the caret, typing and
