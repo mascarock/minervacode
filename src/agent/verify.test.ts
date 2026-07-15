@@ -2,7 +2,12 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { detectVerifyCommand, requestRequiresExecution, runVerification } from './verify.js';
+import {
+  detectVerifyCommand,
+  requestRequiresExecution,
+  runVerification,
+  syntaxCheckCommand,
+} from './verify.js';
 
 const dirs: string[] = [];
 
@@ -313,6 +318,24 @@ describe('detectVerifyCommand', () => {
   it('returns null when nothing applies', async () => {
     const dir = await tempProject();
     expect(await detectVerifyCommand(dir, ['notes.md'], ['notes.md'])).toBeNull();
+  });
+});
+
+describe('syntaxCheckCommand', () => {
+  it('builds a py_compile check for changed python files', () => {
+    expect(syntaxCheckCommand(['main.py'])).toEqual({
+      command: "python3 -m py_compile 'main.py'",
+      source: 'syntax check',
+    });
+  });
+
+  it('builds a node --check for changed js files', () => {
+    expect(syntaxCheckCommand(['app.js'])?.command).toBe("node --check 'app.js'");
+  });
+
+  it('returns null when no changed file has a checkable syntax', () => {
+    expect(syntaxCheckCommand(['notes.md', 'data.csv'])).toBeNull();
+    expect(syntaxCheckCommand([])).toBeNull();
   });
 });
 

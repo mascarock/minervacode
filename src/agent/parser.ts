@@ -215,6 +215,36 @@ function filenameInsideFence(
   return { path: match[1], content: rest.replace(/^\n/, '') };
 }
 
+/**
+ * Lines that carry code structure. Weak models put INSTRUCTIONS inside
+ * code fences ("Then save and exit the editor.") — such prose has none of
+ * these signals.
+ */
+const CODE_LINE =
+  /[=;{}()[\]]|^\s*(?:[#@'"`]|\/\/|\/\*|\*|--|<!--)|^\s*(?:import|from|def|class|return|pass|raise|if|elif|else|for|while|try|except|finally|with|const|let|var|function|export|async|await|public|private|static|package|func|fn|use|struct|enum|impl)\b/;
+
+/** A sentence-like line: capitalized start, several words, terminal punctuation. */
+function isProseLine(line: string): boolean {
+  return /^[A-Z][a-z]/.test(line) && line.split(/\s+/).length >= 3 && /[.!?:]$/.test(line);
+}
+
+/**
+ * True when a fence body reads as sentences ABOUT code rather than code —
+ * the model narrating an edit instead of making it. Writing that into a
+ * source file produces a file of English (observed live as a SyntaxError
+ * on a prose line 2 of main.py).
+ */
+function proseBody(body: string): boolean {
+  const lines = body.split('\n').map((l) => l.trim()).filter(Boolean);
+  let code = 0;
+  let prose = 0;
+  for (const line of lines) {
+    if (CODE_LINE.test(line)) code++;
+    else if (isProseLine(line)) prose++;
+  }
+  return prose > code;
+}
+
 const LANGUAGE_EXTENSIONS: Record<string, Set<string>> = {
   javascript: new Set(['js', 'mjs', 'cjs', 'jsx']),
   js: new Set(['js', 'mjs', 'cjs', 'jsx']),
@@ -407,6 +437,9 @@ function parseCodeBlockLayer(
     if (!path) continue;
     // Markdown prose only ever belongs in markdown/plain-text files.
     if (markdownProse && !/\.(?:md|markdown|txt)$/i.test(path)) continue;
+    // Sentences ABOUT the file inside a code fence are narration, not
+    // contents — writing them produces a source file of English.
+    if (!/\.(?:md|markdown|txt)$/i.test(path) && proseBody(body)) continue;
     // Shell/output fences hold commands, not file contents.
     const mislabeledCSource =
       /\.(?:c|cc|cpp|cxx)$/i.test(path) &&

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.2 — 2026-07-15
+
+Fixes three assisted-mode failures observed live (a prose paragraph was
+written into main.py as "code", and refusal/fence-less replies dead-ended
+the request).
+
+- Prose gate: a code fence whose body reads as sentences ABOUT the file
+  ("Then save and exit the editor.") is narration, never file contents —
+  such fences no longer become Writes. Markdown/plain-text targets still
+  accept prose.
+- Assisted syntax check: after an applied code-block write, a read-only
+  syntax check (py_compile / node --check) runs and a failure is flagged
+  immediately — previously the student discovered broken files only by
+  running them. Advisory only: no execution, no model retries.
+- The one-time format nudge now also fires when the model refuses
+  claiming it cannot write files, or emits code with no fences at all —
+  both previously ended the turn with "no applicable change" instead of
+  retrying with corrected instructions.
+
 ## 0.4.1 — 2026-07-15
 
 Fixes the "I have to ask too many times" loop observed live: follow-up

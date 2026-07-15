@@ -1095,4 +1095,116 @@ describe('autonomous agent loop', () => {
     // Assisted code-block writes end the turn: exactly one model request.
     expect(requestBodies).toHaveLength(1);
   });
+
+  it('warns immediately when an assisted code-block write has a syntax error', async () => {
+    const projectDir = await tempProject();
+    // `finally` without a colon — the file the model proposes is broken.
+    const responses = [
+      'Updated `main.py`:\n\n```python\ntry:\n    print("hi")\nfinally\n    print("done")\n```',
+    ];
+    const requestBodies: unknown[] = [];
+    const statuses: string[] = [];
+
+    await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Write me a program that prints hi.',
+      projectDir,
+      permissionMode: 'default',
+      language: 'en',
+      events: {
+        onText() {},
+        onToolStart() {},
+        onToolEnd() {},
+        onStatus: (text) => statuses.push(text),
+        async confirm() {
+          return true;
+        },
+      },
+    });
+
+    expect(statuses.some((s) => s.startsWith('⚠') && /syntax/i.test(s))).toBe(true);
+    // Advisory only: no extra model round-trips in assisted mode.
+    expect(requestBodies).toHaveLength(1);
+  });
+
+  it('stays quiet when an assisted code-block write compiles cleanly', async () => {
+    const projectDir = await tempProject();
+    const responses = ['Updated `main.py`:\n\n```python\nprint("hi")\n```'];
+    const statuses: string[] = [];
+
+    await runAgent(mockClient(responses), {
+      history: [],
+      prompt: 'Write me a program that prints hi.',
+      projectDir,
+      permissionMode: 'default',
+      language: 'en',
+      events: {
+        onText() {},
+        onToolStart() {},
+        onToolEnd() {},
+        onStatus: (text) => statuses.push(text),
+        async confirm() {
+          return true;
+        },
+      },
+    });
+
+    expect(statuses.filter((s) => s.startsWith('⚠'))).toEqual([]);
+  });
+
+  it('nudges once when the model refuses claiming it cannot write files', async () => {
+    const projectDir = await tempProject();
+    const responses = [
+      "I'm sorry, but I am unable to perform actions like writing scripts or running external programs within this chat interface. However, if you would like help understanding how to implement sorting functionality using Python, I'd be happy to assist!",
+      'Updated `main.py`:\n\n```python\nnums = sorted(int(input()) for _ in range(5))\nprint(nums)\n```',
+    ];
+    const requestBodies: unknown[] = [];
+
+    await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Python script that asks for the user input of 5 numbers and then it sort',
+      projectDir,
+      permissionMode: 'default',
+      language: 'en',
+      events: {
+        onText() {},
+        onToolStart() {},
+        onToolEnd() {},
+        async confirm() {
+          return true;
+        },
+      },
+    });
+
+    expect(requestBodies).toHaveLength(2);
+    expect(existsSync(path.join(projectDir, 'main.py'))).toBe(true);
+  });
+
+  it('nudges once when the model emits code without fences', async () => {
+    const projectDir = await tempProject();
+    const responses = [
+      'Sure thing—let’s proceed step‐by‐step.\n\nFunction definition – get_sorted()\n\ndef get_sorted(numbers):\n    """Returns a sorted list."""\n    return sorted(numbers)\n\nNow you can simply call get_sorted() with a list of five integers.',
+      'Updated `main.py`:\n\n```python\nnums = sorted(int(input()) for _ in range(5))\nprint(nums)\n```',
+    ];
+    const requestBodies: unknown[] = [];
+
+    await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Python script that asks for the user input of 5 numbers and then it sort',
+      projectDir,
+      permissionMode: 'default',
+      language: 'en',
+      events: {
+        onText() {},
+        onToolStart() {},
+        onToolEnd() {},
+        async confirm() {
+          return true;
+        },
+      },
+    });
+
+    expect(requestBodies).toHaveLength(2);
+    expect(existsSync(path.join(projectDir, 'main.py'))).toBe(true);
+  });
 });

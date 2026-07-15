@@ -79,6 +79,27 @@ function runScriptCommand(pm: PackageManager, script: string): string {
 }
 
 /**
+ * Read-only syntax check for changed files, or null when none applies.
+ * Used in assisted mode, where nothing is executed without approval but a
+ * broken file should still be flagged before the student runs it.
+ */
+export function syntaxCheckCommand(changedPaths: string[]): VerifyCommand | null {
+  const unique = [...new Set(changedPaths)];
+  const py = unique.filter((p) => p.endsWith('.py'));
+  if (py.length) {
+    return { command: `python3 -m py_compile ${py.map(quote).join(' ')}`, source: 'syntax check' };
+  }
+  const js = unique.filter((p) => /\.(js|mjs|cjs)$/.test(p));
+  if (js.length) {
+    return {
+      command: js.map((f) => `node --check ${quote(f)}`).join(' && '),
+      source: 'syntax check',
+    };
+  }
+  return null;
+}
+
+/**
  * Picks the command the harness runs to verify the agent's file changes.
  * Priority: explicit Test command in .minervacli.md, then the project's
  * test setup, then a syntax check of the changed files.

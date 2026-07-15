@@ -531,6 +531,94 @@ x = 1
   });
 });
 
+describe('parseToolCalls — prose fence bodies are not source files', () => {
+  // The exact failure observed live: every ```python fence in a one-file
+  // project resolves to main.py, and the 7B model puts INSTRUCTIONS about
+  // editing the file inside such fences. Those must never become Writes.
+  const opts = {
+    codeBlockWriteFallback: true,
+    knownFiles: ['main.py'],
+    preferredFiles: ['main.py'],
+    guessPreferredFile: true,
+  };
+
+  it('skips a python fence whose body is prose instructions about the file', () => {
+    const response = [
+      'let’s simply add the filename on its own line just before the fenced block:',
+      '',
+      '```python',
+      'Updated `main.py`:',
+      '',
+      "The rest of the script remains unchanged since it doesn't depend on specific lines within the file. Just paste those two lines together wherever you see “Updated” above each section where you would normally write your code.",
+      '```',
+    ].join('\n');
+    expect(parseToolCalls(response, opts).toolCalls).toEqual([]);
+  });
+
+  it('skips a python fence holding editor instructions', () => {
+    const response = [
+      '```python',
+      'Then save and exit the editor. Once you run the script again, it should execute without any syntax errors.',
+      '```',
+    ].join('\n');
+    expect(parseToolCalls(response, opts).toolCalls).toEqual([]);
+  });
+
+  it('still writes real code whose strings and comments read like prose', () => {
+    const response = [
+      'Here is the fix:',
+      '',
+      '```python',
+      'nums = input().split()',
+      'try:',
+      '    nums = [int(i) for i in nums]',
+      'except ValueError:',
+      '    print("Please enter exactly three numbers.")',
+      'total = sum(sorted(nums))',
+      'print(total)  # Print the final result',
+      '```',
+    ].join('\n');
+    expect(parseToolCalls(response, opts).toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'Write',
+        args: expect.objectContaining({ path: 'main.py' }),
+      }),
+    ]);
+  });
+
+  it('keeps a code fence that trails off into one prose sentence', () => {
+    const response = [
+      '```python',
+      'import math',
+      '',
+      'def is_prime(n):',
+      '    return n > 1 and all(n % i for i in range(2, int(math.sqrt(n)) + 1))',
+      '',
+      'print(is_prime(7))',
+      'This fixed syntax error makes the program execute without errors.',
+      '```',
+    ].join('\n');
+    expect(parseToolCalls(response, opts).toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'Write',
+        args: expect.objectContaining({ path: 'main.py' }),
+      }),
+    ]);
+  });
+
+  it('still allows prose bodies for markdown and plain-text targets', () => {
+    const response =
+      'Updated `NOTES.md`:\n\n```markdown\nJust some notes about the running project.\n```';
+    const result = parseToolCalls(response, { codeBlockWriteFallback: true });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'Write',
+        args: expect.objectContaining({ path: 'NOTES.md' }),
+      }),
+    ]);
+  });
+});
+
 describe('parseToolCalls — plain text', () => {
   it('returns text unchanged with no tool calls', () => {
     const response = 'La funzione calcola la somma di due numeri.';

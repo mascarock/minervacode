@@ -19,6 +19,7 @@ import {
   detectVerifyCommand,
   requestRequiresExecution,
   runVerification,
+  syntaxCheckCommand,
 } from './verify.js';
 import { compactMessages } from './compact.js';
 import { buildRepoMap } from './repo-map.js';
@@ -276,6 +277,14 @@ const ACTION_CLAIM =
 
 /** The model hallucinates a web UI ("click the Show Code button"). */
 const UI_CLAIM = /\b(?:show\s+code|pulsante|button|click\w*|clicc\w*)\b/i;
+
+/** The model refuses, wrongly claiming it cannot write files or run code. */
+const CAPABILITY_REFUSAL =
+  /\b(?:(?:i\s+am|i'm)\s+(?:unable|not able)\s+to|i\s+can(?:no|')t|non\s+(?:posso|sono in grado di))\s+(?:perform|write|creat\w*|run|execut\w*|modif\w*|access|scriv\w*|cre\w*|esegu\w*)/i;
+
+/** Code structure in plain text — the model forgot the fences entirely. */
+const UNFENCED_CODE =
+  /^[ \t]*(?:def\s+\w+\s*\(|class\s+\w+\s*[:({]|from\s+[\w.]+\s+import\s|#include\s*[<"]|function\s+\w+\s*\(|(?:int|void)\s+main\s*\()/m;
 
 /** The request asks for a program that READS USER INPUT. */
 const EXPECTS_USER_INPUT =
@@ -571,7 +580,13 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       if (
         !nudged &&
         !changes.length &&
-        (response.includes('```') || ACTION_CLAIM.test(response) || UI_CLAIM.test(response))
+        (response.includes('```') ||
+          ACTION_CLAIM.test(response) ||
+          UI_CLAIM.test(response) ||
+          // Refusals and fence-less code only warrant a retry when the
+          // request actually asked for a change.
+          (requestExpectsChanges(opts.prompt) &&
+            (CAPABILITY_REFUSAL.test(response) || UNFENCED_CODE.test(response))))
       ) {
         nudged = true;
         messages.push({
@@ -962,8 +977,24 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     }
 
     // In assisted mode the code-block fallback ends the turn — the student
-    // decides what happens next. Auto mode verifies and continues.
-    if (assistedCodeblockOnly) break;
+    // decides what happens next. Auto mode verifies and continues. A cheap
+    // read-only syntax check still runs so a broken applied file is flagged
+    // NOW instead of when the student runs it (advisory: no model retries,
+    // nothing executed).
+    if (assistedCodeblockOnly) {
+      const applied = [...new Set(unverified)];
+      const cmd = applied.length ? syntaxCheckCommand(applied) : null;
+      if (cmd) {
+        const { ok, output } = await runVerification(cmd, opts.projectDir, opts.signal);
+        if (!ok) {
+          const detail = output.trim().split('\n').slice(-3).join('\n');
+          opts.events.onStatus?.(
+            `⚠ Syntax check failed for ${applied.join(', ')} — the applied file does not parse:\n${detail}`,
+          );
+        }
+      }
+      break;
+    }
 
     await harnessVerify(results);
     messages.push({ role: 'user', content: results.join('\n\n') });
