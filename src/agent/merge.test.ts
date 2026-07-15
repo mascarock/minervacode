@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mergePartialWrite } from './merge.js';
+import { mergePartialWrite, removedTopLevelDefinitions } from './merge.js';
 
 const EXISTING = `import math
 
@@ -108,9 +108,9 @@ async def fetch_data():
     expect(merged).not.toContain('return 1');
   });
 
-  it('returns null for new files and non-python paths', () => {
+  it('returns null for new files and unsupported paths', () => {
     expect(mergePartialWrite('calc.py', '', 'def average():\n    pass\n')).toBeNull();
-    expect(mergePartialWrite('app.js', 'function a() {}', 'function a() { return 1; }')).toBeNull();
+    expect(mergePartialWrite('notes.md', '# old', '# new')).toBeNull();
   });
 
   it('keeps blank-line spacing between functions', () => {
@@ -157,5 +157,107 @@ def average(numbers):
     expect(merged).toContain('import statistics');
     expect(merged).not.toContain('debug!');
     expect(merged).not.toContain('CONSTANT = 42');
+  });
+});
+
+describe('mergePartialWrite for JavaScript and TypeScript', () => {
+  const existing = `import { clamp } from './numbers.js';
+
+export function add(a, b) {
+  return a - b;
+}
+
+export function multiply(a, b) {
+  return a * b;
+}
+`;
+
+  it('merges one proposed function without deleting another export', () => {
+    const proposed = `export function add(a, b) {
+  return a + b;
+}
+`;
+    const merged = mergePartialWrite('src/calc.js', existing, proposed);
+    expect(merged).toContain('return a + b');
+    expect(merged).toContain('export function multiply');
+    expect(merged).toContain("import { clamp } from './numbers.js'");
+  });
+
+  it('preserves unrelated functions when the proposal includes JSDoc', () => {
+    const proposed = `/** Add two numbers. */
+export function add(a, b) {
+  return a + b;
+}
+`;
+    const merged = mergePartialWrite('src/calc.ts', existing, proposed);
+    expect(merged).toContain('/** Add two numbers. */');
+    expect(merged).toContain('export function multiply');
+  });
+
+  it('preserves an existing named export when the weak proposal drops the modifier', () => {
+    const proposed = `function add(a, b) {
+  return a + b;
+}
+`;
+    const merged = mergePartialWrite('src/calc.js', existing, proposed);
+    expect(merged).toContain('export function add');
+    expect(merged).toContain('export function multiply');
+  });
+
+  it('handles arrow-function declarations as merge anchors', () => {
+    const oldArrow = 'export const add = (a, b) => a - b;\n\nexport const multiply = (a, b) => a * b;\n';
+    const proposed = 'export const add = (a, b) => a + b;\n';
+    const merged = mergePartialWrite('calc.ts', oldArrow, proposed);
+    expect(merged).toContain('add = (a, b) => a + b');
+    expect(merged).toContain('multiply = (a, b) => a * b');
+  });
+
+  it('treats inline-comment arrow declarations as separate blocks', () => {
+    const proposed =
+      'export const add = (a, b) => a + b; // fixed\n' +
+      'export const multiply = (a, b) => a * b; // preserved\n';
+    const merged = mergePartialWrite('calc.js', existing, proposed);
+    expect(merged).toContain('export const add');
+    expect(merged).toContain('export const multiply');
+    expect(merged).not.toContain('export function multiply');
+  });
+
+  it('hoists imports required by a partial replacement', () => {
+    const proposed = `import { sum } from './sum.js';
+
+export function add(a, b) {
+  return sum(a, b);
+}
+`;
+    const merged = mergePartialWrite('calc.js', existing, proposed);
+    expect(merged).toContain("import { sum } from './sum.js';");
+    expect(merged).toContain('export function multiply');
+  });
+
+  it('reports definitions that an unrelated overwrite would delete', () => {
+    expect(
+      removedTopLevelDefinitions('calc.js', existing, "import { multiply } from './lib.js';\n"),
+    ).toEqual(['add', 'multiply']);
+    expect(
+      removedTopLevelDefinitions(
+        'calc.js',
+        existing,
+        'export const add = (a, b) => a + b;\nexport const multiply = (a, b) => a * b;\n',
+      ),
+    ).toEqual([]);
+  });
+
+  it('returns null for a complete proposal that restates every function', () => {
+    const proposed = `import { clamp } from './numbers.js';
+
+export function add(a, b) {
+  return a + b;
+}
+
+export function multiply(a, b) {
+  return a * b;
+}
+`;
+    expect(mergePartialWrite('calc.js', existing, proposed)).toBeNull();
   });
 });

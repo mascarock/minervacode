@@ -23,6 +23,8 @@ export interface ParseOptions {
   codeBlockWriteFallback?: boolean;
   /** Existing project paths, used to validate code-block filename guesses. */
   knownFiles?: string[];
+  /** Unique relevance-ranked source candidates for filename-less code fences. */
+  preferredFiles?: string[];
   /** Registered tool names. XML blocks naming only unknown tools do not
    * suppress the JSON and code-block fallback layers. */
   knownTools?: string[];
@@ -41,8 +43,8 @@ const FILENAME = /([\w./-]+\.[A-Za-z0-9]{1,6})/g;
  * after an explicit marker word ("Updated calc.py: removed the bug"), so a
  * comment that merely mentions a file does not count.
  */
-const COMMENT_PREFIX = /^(?:#|\/\/|--|;+|\/\*|<!--)\s*/;
-const MARKER_BARE = /^[`'"]?([\w./-]+\.[A-Za-z0-9]{1,6})[`'"]?\s*(?:\*\/|-->)?\s*:?\s*$/;
+const COMMENT_PREFIX = /^(?:#|\/\/|--|;+|\/\*+|<!--)\s*/;
+const MARKER_BARE = /^[`'"]?([\w./-]+\.[A-Za-z0-9]{1,6})[`'"]?\s*(?:\*+\/|-->)?\s*:?\s*$/;
 const MARKER_WORDED = /^(?:updated?|new file|file(?:name)?|path)\b[\s:]*[`'"]?([\w./-]+\.[A-Za-z0-9]{1,6})[`'"]?/i;
 
 /** Fence languages that hold commands or output, not file contents. */
@@ -161,7 +163,35 @@ function filenameInsideFence(
   return { path: match[1], content: rest.replace(/^\n/, '') };
 }
 
-function parseCodeBlockLayer(response: string, knownFiles?: string[]): ParsedToolCall[] {
+const LANGUAGE_EXTENSIONS: Record<string, Set<string>> = {
+  javascript: new Set(['js', 'mjs', 'cjs', 'jsx']),
+  js: new Set(['js', 'mjs', 'cjs', 'jsx']),
+  typescript: new Set(['ts', 'mts', 'cts', 'tsx']),
+  ts: new Set(['ts', 'mts', 'cts', 'tsx']),
+  python: new Set(['py']),
+  py: new Set(['py']),
+  java: new Set(['java']),
+  go: new Set(['go']),
+  rust: new Set(['rs']),
+  html: new Set(['html']),
+  css: new Set(['css', 'scss']),
+};
+
+function uniquePreferredPath(lang: string, preferredFiles?: string[]): string | undefined {
+  if (!preferredFiles?.length) return undefined;
+  const extensions = LANGUAGE_EXTENSIONS[lang.toLowerCase()];
+  const candidates = preferredFiles.filter((file) => {
+    if (!extensions || !lang) return true;
+    return extensions.has(file.split('.').at(-1)?.toLowerCase() ?? '');
+  });
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+function parseCodeBlockLayer(
+  response: string,
+  knownFiles?: string[],
+  preferredFiles?: string[],
+): ParsedToolCall[] {
   const calls: ParsedToolCall[] = [];
   for (const match of response.matchAll(CODE_BLOCK)) {
     const [raw, lang, content] = match;
@@ -184,6 +214,11 @@ function parseCodeBlockLayer(response: string, knownFiles?: string[]): ParsedToo
       path = inside.path;
       body = inside.content;
     }
+
+    // If relevance ranking found exactly one matching non-test source file,
+    // a filename-less implementation fence is unambiguous. This is kept out
+    // of the generic known-file list so two same-language files still nudge.
+    path ??= uniquePreferredPath(lang, preferredFiles);
 
     if (!path) continue;
     // Shell/output fences hold commands, not file contents.
@@ -213,7 +248,7 @@ export function parseToolCalls(response: string, options: ParseOptions = {}): Pa
   if (calls.length && junk.length === calls.length) calls = [];
   if (!calls.length) calls = parseJsonLayer(response);
   if (!calls.length && options.codeBlockWriteFallback) {
-    calls = parseCodeBlockLayer(response, options.knownFiles);
+    calls = parseCodeBlockLayer(response, options.knownFiles, options.preferredFiles);
     calls.push(...junk.map((c) => ({ ...c, args: {} })));
   }
 

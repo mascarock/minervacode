@@ -5,15 +5,18 @@ import type { ChatMessage } from '../types.js';
 import { getTool, getTools } from '../tools/registry.js';
 import { resolveInProject, type Tool } from '../tools/tool.js';
 import type { AppliedChange, ChangeLog } from './context.js';
-import { mergePartialWrite } from './merge.js';
+import { mergePartialWrite, removedTopLevelDefinitions } from './merge.js';
 import { parseToolCalls } from './parser.js';
 import { needsApproval, type PermissionMode } from './permissions.js';
 import { buildPreview, filePatch, readIfExists } from './preview.js';
 import type { NetChange } from './rollback.js';
 import { runReview } from './review.js';
 import { detectVerifyCommand, runVerification } from './verify.js';
+import { compactMessages } from './compact.js';
+import { buildRepoMap } from './repo-map.js';
 import {
   buildSystemPrompt,
+  buildTurnPrompt,
   formatToolResult,
   languageInstruction,
   listProjectFiles,
@@ -42,6 +45,23 @@ const VERB_GAP = String.raw`(?:\s+(?:the|a|an|some|more|new|unit|failing|broken|
 const TEST_NOUN = String.raw`(?:tests?\b|specs?\b|test\s+(?:file|case|suite)s?\b|test_\w+|\w+_test\b)`;
 
 const WANTS_TEST_CHANGES = new RegExp(`\\b${CHANGE_VERB}${VERB_GAP}${TEST_NOUN}`, 'i');
+const FORBIDS_TEST_CHANGES = new RegExp(
+  `\\b(?:(?:do\\s+not|don't|dont|never|without|non|senza)\\s+${CHANGE_VERB}${VERB_GAP}${TEST_NOUN})`,
+  'i',
+);
+const WANTS_NEW_FILES =
+  /\b(?:creat\w*|writ\w*|add\w*|generat\w*|scaffold\w*|implement\w*|build\w*|crea\w*|scriv\w*|aggiung\w*|genera\w*|implementa\w*|costru\w*)\b/i;
+const WANTS_MADE_ARTIFACT =
+  /\bmak\w*\s+(?:(?:it|this|the|a|an)\s+){0,3}(?:new\s+)?(?:file|module|program|package|script|app|component|note)\b/i;
+const FORBIDS_NEW_FILES =
+  /\b(?:do\s+not|don't|dont|never|without|non|senza)\s+(?:creat\w*|writ\w*|add\w*|generat\w*|scaffold\w*|mak\w*|crea\w*|scriv\w*|aggiung\w*|genera\w*)\b/i;
+const SOURCE_FILE_PATH = /\.(?:[cm]?[jt]sx?|py|go|rs|java|c|cc|cpp|cxx|h|hpp)$/i;
+const EXPECTS_FILE_CHANGES =
+  /\b(?:fix\w*|correct\w*|creat\w*|writ\w*|add\w*|updat\w*|modif\w*|edit\w*|chang\w*|implement\w*|refactor\w*|remove\w*|rename\w*|corregg\w*|sistem\w*|crea\w*|scriv\w*|aggiung\w*|aggiorn\w*|modific\w*|cambi\w*|implementa\w*|rimuov\w*|rinomina\w*)\b/i;
+const INFORMATIONAL_REQUEST =
+  /^\s*(?:explain|review|inspect|analy[sz]e|describe|why|how|what|show\s+me|spiega|rivedi|analizza|descrivi|perch[eé]|come|cosa)\b/i;
+const ALLOWS_DEFINITION_REMOVAL =
+  /\b(?:remov\w*|delet\w*|rewrit\w*|replace\w*|refactor\w*|rimuov\w*|elimina\w*|riscriv\w*|sostitui\w*|rifattorizz\w*)\b/i;
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
@@ -54,11 +74,22 @@ function escapeRegExp(s: string): string {
  * pass", "verify with the tests", or naming a test file as context do not.
  */
 export function requestAllowsTestEdit(prompt: string, testPath: string): boolean {
+  if (FORBIDS_TEST_CHANGES.test(prompt)) return false;
   if (WANTS_TEST_CHANGES.test(prompt)) return true;
   const base = testPath.split('/').at(-1);
   if (!base) return false;
   const targetsFile = new RegExp(`\\b${CHANGE_VERB}${VERB_GAP}\`?${escapeRegExp(base)}`, 'i');
   return targetsFile.test(prompt);
+}
+
+/** A fix request may edit existing files, but must not invent unrelated ones. */
+export function requestAllowsNewFile(prompt: string): boolean {
+  return !FORBIDS_NEW_FILES.test(prompt) &&
+    (WANTS_NEW_FILES.test(prompt) || WANTS_MADE_ARTIFACT.test(prompt));
+}
+
+export function requestExpectsChanges(prompt: string): boolean {
+  return !INFORMATIONAL_REQUEST.test(prompt) && EXPECTS_FILE_CHANGES.test(prompt);
 }
 
 export interface ToolCallEvent {
@@ -92,7 +123,7 @@ export interface AgentOptions {
   changeLog?: ChangeLog;
 }
 
-export type AgentStatus = 'completed' | 'aborted' | 'turn-limit';
+export type AgentStatus = 'completed' | 'aborted' | 'turn-limit' | 'no-change';
 
 export interface AgentResult {
   /** Updated conversation history (without the system prompt). */
@@ -189,13 +220,17 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   const tools = getTools();
   const auto = opts.permissionMode === 'dontAsk';
   const selfReview = opts.review ?? auto;
-  const [projectContext, projectFiles] = await Promise.all([
+  opts.events.onStatus?.('Mapping repository context…');
+  const [projectContext, repoMap] = await Promise.all([
     loadProjectContext(opts.projectDir),
-    listProjectFiles(opts.projectDir),
+    buildRepoMap({ projectDir: opts.projectDir, query: opts.prompt }),
   ]);
+  const projectFiles = repoMap.files;
+  const knownProjectFiles = new Set(projectFiles.map((file) => file.replace(/^\.\//, '')));
+  const projectHasSourceFiles = projectFiles.some((file) => SOURCE_FILE_PATH.test(file));
   const { files: fileContents, skipped } = await loadProjectFileContents(
     opts.projectDir,
-    projectFiles,
+    repoMap.contextFiles,
   );
   const instructions = buildSystemPrompt({
     projectDir: opts.projectDir,
@@ -203,20 +238,38 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     language: opts.language,
     autonomous: auto,
     projectContext,
-    projectFiles,
-    fileContents,
-    skippedFiles: skipped,
   });
 
   // Chat Minerva's Open WebUI drops system-role messages, so the agent
-  // instructions ride inside the first user message of the conversation.
+  // instructions ride in a stable first user message. Refreshable repository
+  // context stays in a separate turn so old file snapshots can be compacted.
   const firstTurn = opts.history.length === 0;
-  const userContent = firstTurn
-    ? `${instructions}\n\n---\n\nStudent request: ${opts.prompt}`
-    : `${languageInstruction(opts.language)}\n\nStudent request: ${opts.prompt}`;
+  let initialVerification: { command: string; output: string } | undefined;
+  if (auto && firstTurn && requestExpectsChanges(opts.prompt)) {
+    const cmd = await detectVerifyCommand(opts.projectDir, projectFiles, []);
+    if (cmd && /test|pytest|unittest|\.minervacli\.md/i.test(cmd.source)) {
+      const bash = getTool('Bash');
+      const event: ToolCallEvent | null = bash
+        ? { tool: bash, input: { command: cmd.command }, summary: cmd.command }
+        : null;
+      opts.events.onStatus?.(`Running initial verification (${cmd.source}): ${cmd.command}`);
+      if (event) opts.events.onToolStart(event);
+      const baseline = await runVerification(cmd, opts.projectDir, opts.signal);
+      if (event) opts.events.onToolEnd({ ...event, ok: baseline.ok, result: baseline.output });
+      if (!baseline.ok) initialVerification = { command: cmd.command, output: baseline.output };
+    }
+  }
+  const userContent = `${languageInstruction(opts.language)}\n\n${buildTurnPrompt({
+    request: opts.prompt,
+    repositoryMap: repoMap.map,
+    fileContents,
+    skippedFiles: skipped,
+    initialVerification,
+  })}`;
 
-  const messages: ChatMessage[] = [
+  let messages: ChatMessage[] = [
     ...opts.history,
+    ...(firstTurn ? [{ role: 'user' as const, content: instructions }] : []),
     { role: 'user', content: userContent },
   ];
   let finalText = '';
@@ -231,6 +284,18 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   let verifyRuns = 0;
   let nudged = false;
   let reviewed = false;
+  let compactionReported = false;
+
+  const compactContext = () => {
+    const result = compactMessages(messages);
+    messages = result.messages;
+    if (result.compacted && !compactionReported) {
+      compactionReported = true;
+      opts.events.onStatus?.(
+        `Compacted context from ~${result.before.estimatedTokens.toLocaleString('en-US')} to ~${result.after.estimatedTokens.toLocaleString('en-US')} input tokens.`,
+      );
+    }
+  };
 
   const recordChange = (change: FileChange) => {
     changes.push({ path: change.path, patch: change.patch });
@@ -288,6 +353,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   };
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
+    compactContext();
     const response = await streamChat(client, messages, { signal: opts.signal });
     messages.push({ role: 'assistant', content: response });
 
@@ -297,6 +363,9 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     const { toolCalls, text } = parseToolCalls(response, {
       codeBlockWriteFallback: true,
       knownFiles: projectFiles,
+      preferredFiles: requestExpectsChanges(opts.prompt)
+        ? repoMap.contextFiles.filter((file) => !TEST_FILE_PATH.test(file))
+        : undefined,
       knownTools: tools.map((t) => t.name),
     });
     if (text) {
@@ -378,6 +447,26 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
 
       const input = parsed.data as Record<string, unknown>;
 
+      if (
+        auto &&
+        (tool.name === 'Write' || tool.name === 'Edit') &&
+        typeof input.path === 'string' &&
+        !knownProjectFiles.has(input.path.replace(/^\.\//, '')) &&
+        projectHasSourceFiles &&
+        !requestAllowsNewFile(opts.prompt)
+      ) {
+        const refused = `Refused: ${input.path} does not exist and this request did not ask to create files. Fix the relevant existing source files; do not invent unrelated files.`;
+        opts.events.onToolEnd({
+          tool,
+          input,
+          summary: tool.summarize(input),
+          ok: false,
+          result: refused,
+        });
+        results.push(formatToolResult(tool.name, refused, false));
+        continue;
+      }
+
       // In auto mode nothing stops a weak model from "fixing" a failure by
       // rewriting the tests — refuse test-file writes the student did not
       // ask for. Assisted mode keeps the human approval as the gate.
@@ -416,6 +505,37 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         }
       }
 
+      if (
+        auto &&
+        tool.name === 'Write' &&
+        typeof input.path === 'string' &&
+        typeof input.content === 'string' &&
+        !ALLOWS_DEFINITION_REMOVAL.test(opts.prompt)
+      ) {
+        try {
+          const target = resolveInProject(opts.projectDir, input.path);
+          const removed = removedTopLevelDefinitions(
+            input.path,
+            await readIfExists(target),
+            input.content,
+          );
+          if (removed.length) {
+            const refused = `Refused: this overwrite would delete unrelated definitions (${removed.join(', ')}). Make a focused replacement and preserve existing functions/classes.`;
+            opts.events.onToolEnd({
+              tool,
+              input,
+              summary: tool.summarize(input),
+              ok: false,
+              result: refused,
+            });
+            results.push(formatToolResult(tool.name, refused, false));
+            continue;
+          }
+        } catch {
+          // The Write call reports path/read failures with its normal error.
+        }
+      }
+
       const event: ToolCallEvent = { tool, input, summary: tool.summarize(input) };
 
       if (needsApproval(tool, opts.permissionMode)) {
@@ -439,7 +559,10 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       opts.events.onToolEnd({ ...event, ok, result });
       results.push(formatToolResult(tool.name, result, ok));
 
-      if (change) recordChange(change);
+      if (change) {
+        recordChange(change);
+        knownProjectFiles.add(change.path.replace(/^\.\//, ''));
+      }
       // A successful test/build command run by the model counts as its own
       // verification; an `ls` or `echo` does not.
       if (ok && tool.name === 'Bash' && VERIFYISH_COMMAND.test(String(input.command ?? ''))) {
@@ -482,6 +605,11 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   // true → false. Null means no verification was ever applicable.
   const verified =
     unverified.length && verifyState.last !== null ? false : verifyState.last;
+
+  if (status === 'completed' && requestExpectsChanges(opts.prompt) && changes.length === 0) {
+    status = 'no-change';
+    opts.events.onStatus?.('⚠ The request expected a file change, but no applicable change was produced.');
+  }
 
   if (verified === false) {
     opts.events.onStatus?.('⚠ Changes were not successfully verified when the agent stopped.');

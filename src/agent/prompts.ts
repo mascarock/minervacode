@@ -1,13 +1,13 @@
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Tool } from '../tools/tool.js';
+import { discoverProjectFiles, isSensitiveProjectFile } from './repo-map.js';
 
 export const PROJECT_CONTEXT_FILE = '.minervacli.md';
 
-const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '__pycache__', '.venv', 'venv']);
-const MAX_LISTING = 50;
-
 const MAX_INJECT_FILES = 12;
+const MAX_INJECT_CANDIDATES = 32;
+const MAX_SKIPPED_REPORT = 20;
 const MAX_INJECT_FILE_SIZE = 8 * 1024;
 const MAX_INJECT_TOTAL = 32 * 1024;
 
@@ -38,13 +38,22 @@ export async function loadProjectFileContents(
   const files: ProjectFile[] = [];
   const skipped: string[] = [];
   let total = 0;
+  let candidates = 0;
 
   for (const rel of paths) {
     if (rel.endsWith('/')) continue;
-    if (files.length >= MAX_INJECT_FILES) {
-      skipped.push(rel);
+    if (isSensitiveProjectFile(rel)) {
+      // Never echo secret filenames into model context either.
       continue;
     }
+    if (files.length >= MAX_INJECT_FILES) {
+      // Lower-ranked files are already represented in the token-budgeted
+      // repository map. The skipped list is only for relevant candidates
+      // that could not be injected because of their own contents/size.
+      continue;
+    }
+    if (candidates >= MAX_INJECT_CANDIDATES) continue;
+    candidates++;
     try {
       const content = await readFile(path.join(projectDir, rel), 'utf-8');
       if (
@@ -52,46 +61,22 @@ export async function loadProjectFileContents(
         content.length > MAX_INJECT_FILE_SIZE ||
         total + content.length > MAX_INJECT_TOTAL
       ) {
-        skipped.push(rel);
+        if (skipped.length < MAX_SKIPPED_REPORT) skipped.push(rel);
         continue;
       }
       total += content.length;
       files.push({ path: rel, content });
     } catch {
-      skipped.push(rel);
+      if (skipped.length < MAX_SKIPPED_REPORT) skipped.push(rel);
     }
   }
 
   return { files, skipped };
 }
 
-/** Shallow two-level listing so the model sees real file names up front. */
+/** Full safe project listing, shared with the repository map and verifier. */
 export async function listProjectFiles(projectDir: string): Promise<string[]> {
-  const out: string[] = [];
-  try {
-    const top = await readdir(projectDir, { withFileTypes: true });
-    for (const entry of top) {
-      if (entry.name.startsWith('.') || SKIP_DIRS.has(entry.name)) continue;
-      if (out.length >= MAX_LISTING) break;
-      if (entry.isDirectory()) {
-        out.push(`${entry.name}/`);
-        try {
-          const nested = await readdir(path.join(projectDir, entry.name));
-          for (const name of nested) {
-            if (out.length >= MAX_LISTING) break;
-            if (!name.startsWith('.')) out.push(`${entry.name}/${name}`);
-          }
-        } catch {
-          // unreadable subdirectory — top-level entry is enough
-        }
-      } else {
-        out.push(entry.name);
-      }
-    }
-  } catch {
-    // unreadable project dir — the model can still use Glob
-  }
-  return out;
+  return discoverProjectFiles(projectDir);
 }
 
 export async function loadProjectContext(projectDir: string): Promise<string | null> {
@@ -160,7 +145,9 @@ Project directory: ${projectDir}`,
 - Act on coding requests instead of only describing suggested steps. Inspect the relevant files, make the requested changes, and verify the result.
 - Use the tools below to read files, edit files, and run shell commands. Do not ask the student to run a command that you can run yourself.
 - After changing code, run the relevant tests, build, typecheck, or lint command. If verification fails, diagnose the output, fix the issue, and run it again.
+- Make the smallest source change that addresses the failing behavior. Preserve functions and tests that already pass; a focused bug fix must not rewrite unrelated working logic.
 - Never invent files or file contents that you have not seen.
+- Change only files required by the student's request. Do not rewrite package manifests, compiler configuration, or unrelated files unless the request specifically targets them.
 - Never rewrite or weaken tests to make them pass — fix the source code instead. Only modify test files when the student explicitly asks for it.
 - Briefly explain what you changed and why so the student can learn. Highlight the important concepts in **bold**.
 ${autonomous ? '- Autonomous mode is enabled: proceed with necessary file changes and commands without asking for confirmation.' : '- Approval mode is enabled: the CLI will request confirmation before potentially modifying operations.'}
@@ -186,6 +173,38 @@ Tool results arrive in the next message as <tool_result>. Emit at most 3 tool bl
 export function formatToolResult(name: string, result: string, ok: boolean): string {
   const status = ok ? 'ok' : 'error';
   return `<tool_result name="${name}" status="${status}">\n${result}\n</tool_result>`;
+}
+
+export function buildTurnPrompt(options: {
+  request: string;
+  repositoryMap?: string;
+  fileContents?: ProjectFile[];
+  skippedFiles?: string[];
+  initialVerification?: { command: string; output: string };
+}): string {
+  const sections = [`Student request: ${options.request}`];
+  if (options.initialVerification) {
+    sections.push(
+      `Initial verification failed before any changes. Use this real failure as the primary diagnostic and fix the relevant SOURCE file:\n$ ${options.initialVerification.command}\n${options.initialVerification.output}`,
+    );
+  }
+  if (options.repositoryMap) {
+    sections.push(`Current repository structure:\n${options.repositoryMap}`);
+  }
+  if (options.fileContents?.length) {
+    const blocks = options.fileContents
+      .map((file) => `=== ${file.path} ===\n${file.content}`)
+      .join('\n\n');
+    sections.push(
+      `Relevant current file contents (authoritative for this turn; use Read for anything omitted):\n\n${blocks}`,
+    );
+  }
+  if (options.skippedFiles?.length) {
+    sections.push(
+      `Relevant files not injected because of size or safety limits (use Read when appropriate):\n${options.skippedFiles.join('\n')}`,
+    );
+  }
+  return sections.join('\n\n');
 }
 
 export const PROJECT_CONTEXT_TEMPLATE = `# Project context

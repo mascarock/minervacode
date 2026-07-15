@@ -4,7 +4,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { MinervaClient } from '../api/client.js';
-import { requestAllowsTestEdit, runAgent, type AgentEvents } from './loop.js';
+import type { ChatMessage } from '../types.js';
+import {
+  requestAllowsNewFile,
+  requestExpectsChanges,
+  requestAllowsTestEdit,
+  runAgent,
+  type AgentEvents,
+} from './loop.js';
 
 const dirs: string[] = [];
 
@@ -64,6 +71,10 @@ describe('requestAllowsTestEdit', () => {
     'Make test_calc.py pass by fixing calc.py.',
     'The tests are failing, find out why.',
     'Fix average so all tests are green.',
+    'Fix calc.py but do not modify tests.',
+    "Fix calc.py; don't change test_calc.py.",
+    'Correggi calc.py senza modificare i test.',
+    'Correggi calc.py e non cambiare i test.',
   ])('blocks: %s', (prompt) => {
     expect(requestAllowsTestEdit(prompt, 'test_calc.py')).toBe(false);
     expect(requestAllowsTestEdit(prompt, 'math.test.js')).toBe(false);
@@ -79,7 +90,156 @@ describe('requestAllowsTestEdit', () => {
   });
 });
 
+describe('requestAllowsNewFile', () => {
+  it.each([
+    'Create the answer program.',
+    'Write a note explaining the result.',
+    'Add a new authentication module.',
+    'Implement login support.',
+    'Crea un nuovo file Python.',
+  ])('allows explicit creation intent: %s', (prompt) => {
+    expect(requestAllowsNewFile(prompt)).toBe(true);
+  });
+
+  it.each([
+    'Fix the bug in calc.js.',
+    'Make the existing tests pass by fixing the source.',
+    'Correggi il bug senza cambiare altro.',
+  ])('blocks creation during a focused fix: %s', (prompt) => {
+    expect(requestAllowsNewFile(prompt)).toBe(false);
+  });
+});
+
+describe('requestExpectsChanges', () => {
+  it('distinguishes mutating instructions from informational requests', () => {
+    expect(requestExpectsChanges('Fix the bug in calc.js.')).toBe(true);
+    expect(requestExpectsChanges('Correggi il bug in calc.py.')).toBe(true);
+    expect(requestExpectsChanges('Explain how to fix calc.js.')).toBe(false);
+    expect(requestExpectsChanges('Review the changes.')).toBe(false);
+  });
+});
+
 describe('autonomous agent loop', () => {
+  it('does not report a mutating request as completed when no change was applied', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+
+    const result = await runAgent(mockClient(['I could not find anything to change.']), {
+      history: [],
+      prompt: 'Fix the bug in calc.py.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events,
+    });
+
+    expect(result.status).toBe('no-change');
+    expect(statuses.at(-1)).toContain('no applicable change');
+  });
+
+  it('separates stable instructions from a relevance-ranked current repository snapshot', async () => {
+    const projectDir = await tempProject();
+    await mkdir(path.join(projectDir, 'src'));
+    await writeFile(
+      path.join(projectDir, 'src', 'auth.ts'),
+      'export function validateToken() { return false; }\n',
+    );
+    await writeFile(path.join(projectDir, 'src', 'dates.ts'), 'export function formatDate() {}\n');
+    const requestBodies: unknown[] = [];
+
+    await runAgent(mockClient(['No change needed.'], requestBodies), {
+      history: [],
+      prompt: 'Inspect validateToken in auth.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    const body = requestBodies[0] as { messages: ChatMessage[] };
+    // The mock retains the request array by reference, so the completed
+    // assistant response is appended after postStream receives it.
+    expect(body.messages.slice(0, 2).map((message) => message.role)).toEqual(['user', 'user']);
+    expect(body.messages[0].content).toContain('You are Minerva');
+    expect(body.messages[0].content).not.toContain('return false');
+    expect(body.messages[1].content).toContain('Repository map');
+    expect(body.messages[1].content).toContain('symbols: validateToken');
+    expect(body.messages[1].content).toContain('=== src/auth.ts ===');
+    expect(body.messages[1].content).toContain('return false');
+  });
+
+  it('feeds a failing initial test run into the first model request', async () => {
+    const projectDir = await tempProject();
+    await mkdir(path.join(projectDir, 'src'));
+    await mkdir(path.join(projectDir, 'test'));
+    await writeFile(
+      path.join(projectDir, 'package.json'),
+      JSON.stringify({ type: 'module', scripts: { test: 'node --test' } }),
+    );
+    await writeFile(
+      path.join(projectDir, 'src', 'calc.js'),
+      'export function add(a, b) { return a - b; }\n',
+    );
+    await writeFile(
+      path.join(projectDir, 'test', 'calc.test.js'),
+      "import assert from 'node:assert/strict';\nimport test from 'node:test';\nimport { add } from '../src/calc.js';\ntest('sum', () => assert.equal(add(8, 5), 13));\n",
+    );
+    const requestBodies: unknown[] = [];
+
+    await runAgent(mockClient(['I could not produce a change.'], requestBodies), {
+      history: [],
+      prompt: 'Fix the bug in src/calc.js.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    const firstRequest = JSON.stringify(requestBodies[0]);
+    expect(firstRequest).toContain('Initial verification failed before any changes');
+    expect(firstRequest).toContain('3 !== 13');
+    expect(firstRequest).toContain('npm test --silent');
+  });
+
+  it('compacts old bulk before calling the model and reports it', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'main.py'), 'print(1)\n');
+    const huge = 'OLD_BULK_SENTINEL'.repeat(8_000);
+    const history: ChatMessage[] = [
+      { role: 'user', content: 'Stable agent rules' },
+      { role: 'assistant', content: '<minerva_tool name="Read"><path>old.py</path></minerva_tool>' },
+      { role: 'user', content: `<tool_result name="Read" status="ok">\n${huge}\n</tool_result>` },
+      { role: 'assistant', content: 'Earlier answer' },
+      { role: 'user', content: 'Earlier request' },
+      { role: 'assistant', content: 'Middle answer' },
+      { role: 'user', content: 'Middle request' },
+      { role: 'assistant', content: 'Recent answer' },
+      { role: 'user', content: 'Recent request' },
+    ];
+    const requestBodies: unknown[] = [];
+    const statuses: string[] = [];
+
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+    const result = await runAgent(mockClient(['Done.'], requestBodies), {
+      history,
+      prompt: 'Check main.py.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events,
+    });
+
+    const serialized = JSON.stringify(requestBodies[0]);
+    expect(serialized).toContain('Older successful Read result omitted');
+    expect(serialized).not.toContain(huge);
+    expect(statuses.some((status) => status.startsWith('Compacted context from'))).toBe(true);
+    expect(JSON.stringify(result.history)).toContain('Older successful Read result omitted');
+  });
+
   it('applies a code-block edit, harness-verifies it, and self-reviews', async () => {
     const projectDir = await tempProject();
     const responses = [
@@ -239,6 +399,57 @@ describe('autonomous agent loop', () => {
       'from calc import x\n',
     );
     expect(JSON.stringify(requestBodies[1])).toContain('Refused: test_calc.py is a test file');
+    expect(result.changes).toEqual([]);
+  });
+
+  it('refuses unsolicited new files during a focused fix', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
+    const responses = [
+      '<minerva_tool name="Write">\n<path>unrelated.py</path>\n<content>\nx = 2\n</content>\n</minerva_tool>',
+      'Understood.',
+    ];
+    const requestBodies: unknown[] = [];
+
+    const result = await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Fix the bug in calc.py.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    expect(existsSync(path.join(projectDir, 'unrelated.py'))).toBe(false);
+    expect(JSON.stringify(requestBodies[1])).toContain('did not ask to create files');
+    expect(result.changes).toEqual([]);
+  });
+
+  it('refuses an overwrite that deletes unrelated source definitions', async () => {
+    const projectDir = await tempProject();
+    await writeFile(
+      path.join(projectDir, 'calc.js'),
+      'export function add(a, b) { return a - b; }\n\nexport function multiply(a, b) { return a * b; }\n',
+    );
+    const responses = [
+      '<minerva_tool name="Write">\n<path>calc.js</path>\n<content>\nimport { add } from "./missing.js";\n</content>\n</minerva_tool>',
+      'Understood.',
+    ];
+    const requestBodies: unknown[] = [];
+
+    const result = await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Fix add in calc.js.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    expect(await readFile(path.join(projectDir, 'calc.js'), 'utf8')).toContain(
+      'function multiply',
+    );
+    expect(JSON.stringify(requestBodies[1])).toContain('would delete unrelated definitions');
     expect(result.changes).toEqual([]);
   });
 

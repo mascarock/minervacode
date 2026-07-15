@@ -11,6 +11,8 @@ import { HELP_LINES, sessionInfoLines } from '../ui/info.js';
 import { runAgent } from '../agent/loop.js';
 import { ChangeLog } from '../agent/context.js';
 import { collectGitDiff, runReview } from '../agent/review.js';
+import { compactMessages, formatContextStats } from '../agent/compact.js';
+import { buildRepoMap } from '../agent/repo-map.js';
 import type { PermissionMode } from '../agent/permissions.js';
 import type { AgentLanguage } from '../agent/prompts.js';
 import { getTools } from '../tools/registry.js';
@@ -182,6 +184,24 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
     if (cmd === '/info') {
       const info = await gatherSessionInfo(client, config);
       return push({ kind: 'system', text: sessionInfoLines(info).join('\n') });
+    }
+
+    if (cmd === '/context') {
+      const result = compactMessages(messagesRef.current);
+      messagesRef.current = result.messages;
+      return push({
+        kind: 'system',
+        text: `${formatContextStats(result.after)}${result.compacted ? '\nCompaction ran now.' : ''}`,
+      });
+    }
+
+    if (cmd === '/repomap') {
+      const result = await buildRepoMap({ projectDir, query: rawArg });
+      const cache = result.cacheHit ? 'cache hit' : 'refreshed';
+      return push({
+        kind: 'system',
+        text: `${result.map}\n\n${result.fileCount} files · ${result.symbolCount} symbols · ${cache}${result.truncated ? ' · token-budgeted' : ''}`,
+      });
     }
 
     if (cmd === '/auto') {

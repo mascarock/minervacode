@@ -77,6 +77,8 @@ Slash commands inside the REPL:
 | `/auto` | Toggle auto mode (`/auto on`, `/auto off`) |
 | `/dir` | Show or change the project directory the agent works in |
 | `/language` | Set reply language (`auto`, `en`, or `it`) |
+| `/repomap` | Show the relevance-ranked repository structure (`/repomap auth` focuses it) |
+| `/context` | Show estimated context use and compact old bulk when needed |
 | `/tools` | List agent tools |
 | `/diff` | Show changes applied this session |
 | `/review` | Ask Minerva to review this session's changes (or the pending git diff) |
@@ -111,7 +113,9 @@ minervacli --auto --project-dir ~/compiti "scrivi i test per utils.py"
    not "fix" a failure by rewriting the tests.
 2. **Execute & verify** — after every verifiable code change the CLI runs a
    verification command and feeds the output back so Minerva can fix
-   failures. The command is picked in this order: the `Test:` line of
+   failures. In auto mode it also runs an existing test suite once before the
+   first edit and injects a real failing assertion as the initial diagnostic.
+   The command is picked in this order: the `Test:` line of
    `.minervacli.md` → the `package.json` `test`, `typecheck`, or `build`
    script (npm/yarn/pnpm/bun detected from the lockfile) → `pytest` /
    `unittest` if test files exist → `tsc --noEmit` if `tsconfig.json`
@@ -172,18 +176,29 @@ locally — gated by the permission mode.
 Minerva is a **7B model**, so the harness does the heavy lifting to keep
 it honest:
 
+- **Repository map** — every request gets a fresh, token-budgeted structural
+  map of safe project files, declarations, and imports. Files and symbols are
+  ranked against the request, while unchanged per-file metadata is cached.
+  Secret/key files and dependency/build directories are excluded.
+- **Context compaction** — stable agent rules remain intact while older Read,
+  Bash, tool-call, and complete-file payloads are replaced with deterministic
+  retrieval markers as the input approaches its budget. Recent turns, user
+  intent, and error edges remain available; `/context` reports current use.
 - **Partial-write protection** — when a code block only re-states some of
-  a file's functions, the CLI merges those functions into the existing
-  file instead of overwriting it (a 7B loves to "fix one function" by
-  deleting the rest).
+  a Python, JavaScript, or TypeScript file's functions, the CLI merges those
+  functions into the existing file instead of overwriting it (a 7B loves to
+  "fix one function" by deleting the rest). Existing JS/TS export modifiers
+  are retained.
 - **Format nudging** — if Minerva claims it changed something without
   emitting an applicable change, the CLI restates the expected format once
   and asks again.
 - **Deterministic verification** — tests are run by the CLI, not by the
   model's goodwill; the model only sees (and reacts to) real output.
 - **Guardrails** — file paths are validated against the project listing,
-  writes outside the project directory are rejected, and the review pass
-  ignores findings that just echo the instruction template.
+  writes outside the project directory are rejected, negated requests such as
+  "do not modify tests" are enforced, and focused fixes cannot invent files
+  or erase unrelated top-level definitions. A mutating one-shot request that
+  produces no applicable change exits nonzero instead of claiming success.
 
 Expect to guide it, and keep assisted mode on while you're learning.
 

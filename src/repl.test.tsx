@@ -28,6 +28,22 @@ function mockClient(responses: string[]): MinervaClient {
 }
 
 describe('runChatOnce', () => {
+  it('returns false when a fix request completes without an applicable change', async () => {
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-once-'));
+    dirs.push(projectDir);
+    await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    const ok = await runChatOnce(mockClient(['Nothing to change.']), 'Fix calc.py.', {
+      projectDir,
+      auto: true,
+      language: 'en',
+    });
+
+    expect(ok).toBe(false);
+    expect(log.mock.calls.flat().join(' ')).toContain('no applicable file change');
+  });
+
   it('reverts the run and reports failure when verification never passes', async () => {
     const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-once-'));
     dirs.push(projectDir);

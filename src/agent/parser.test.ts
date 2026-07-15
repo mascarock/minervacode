@@ -147,6 +147,31 @@ x = 1
     expect(parseToolCalls(response, { codeBlockWriteFallback: true }).toolCalls).toEqual([]);
   });
 
+  it('uses a unique relevance-ranked source for a filename-less matching fence', () => {
+    const response = 'Here is the fix:\n\n```javascript\nfunction add(a, b) { return a + b; }\n```';
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['src/calc.js', 'test/calc.test.js'],
+      preferredFiles: ['src/calc.js'],
+    });
+    expect(result.toolCalls[0]).toEqual(
+      expect.objectContaining({
+        tool: 'Write',
+        args: { path: 'src/calc.js', content: 'function add(a, b) { return a + b; }\n' },
+      }),
+    );
+  });
+
+  it('does not guess when several preferred files match the fence language', () => {
+    const response = '```javascript\nfunction add(a, b) { return a + b; }\n```';
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['src/calc.js', 'src/math.js'],
+      preferredFiles: ['src/calc.js', 'src/math.js'],
+    });
+    expect(result.toolCalls).toEqual([]);
+  });
+
   it('detects a filename marker comment inside the fence and strips it', () => {
     const response = '```python\n# Updated `calc.py`\n\ndef add(a, b):\n    return a + b\n```';
     const result = parseToolCalls(response, { codeBlockWriteFallback: true });
@@ -154,6 +179,20 @@ x = 1
       expect.objectContaining({
         tool: 'Write',
         args: { path: 'calc.py', content: 'def add(a, b):\n    return a + b\n' },
+      }),
+    ]);
+  });
+
+  it('accepts a decorative block-comment filename header from weaker models', () => {
+    const response = '```javascript\n/*** src/calc.js ***/\nexport const add = (a, b) => a + b;\n```';
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['src/calc.js'],
+    });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'Write',
+        args: { path: 'src/calc.js', content: 'export const add = (a, b) => a + b;\n' },
       }),
     ]);
   });

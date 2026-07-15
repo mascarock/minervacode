@@ -36,6 +36,8 @@ export const HELP_LINES = [
   '/auto    toggle auto mode (on|off) — assisted asks before changes',
   '/dir     show or change the project directory the agent works in',
   '/language set reply language (auto|en|it)',
+  '/repomap show the ranked repository structure (/repomap <focus>)',
+  '/context show context use and compact old bulk if needed',
   '/tools   list agent tools',
   '/diff    show changes applied this session',
   '/review  ask Minerva to review session changes (or the git diff)',

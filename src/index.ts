@@ -18,6 +18,7 @@ import { collectGitDiff, runReview, type ReviewSeverity } from './agent/review.j
 import type { AgentSettings } from './tui/App.js';
 
 const program = new Command();
+const CLI_VERSION = '0.2.0';
 
 function parsePermissionMode(value: string): PermissionMode {
   if (!PERMISSION_MODES.includes(value as PermissionMode)) {
@@ -64,7 +65,7 @@ async function scaffoldProjectContext(projectDir: string): Promise<void> {
 program
   .name('minervacli')
   .description('Terminal chat client and coding agent for Chat Minerva')
-  .version('0.1.0')
+  .version(CLI_VERSION)
   // Without this, the root --project-dir option swallows the identically
   // named option of subcommands like `review`.
   .enablePositionalOptions()

@@ -110,6 +110,13 @@ export async function runChatOnce(
     return false;
   }
 
+  if (!succeeded && permissionMode === 'dontAsk' && !result.netChanges.length) {
+    const reason = result.status === 'no-change'
+      ? 'no applicable file change was produced'
+      : `run ended with status "${result.status}"`;
+    console.log(chalk.yellow(`\n  ⚠ ${reason}.`));
+  }
+
   if (result.changes.length) {
     const files = [...new Set(result.changes.map((c) => c.path))];
     console.log(chalk.dim(`\n  changed: ${files.join(', ')}`));
