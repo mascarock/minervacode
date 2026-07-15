@@ -70,6 +70,7 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
   const [config, setConfig] = useState(initialConfig);
   const [waitStart, setWaitStart] = useState(0);
   const [liveTool, setLiveTool] = useState('');
+  const [inputHistory, setInputHistory] = useState<string[]>([]);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
   const abortRef = useRef<AbortController | null>(null);
@@ -322,6 +323,7 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
   const onSubmit = (raw: string) => {
     const line = raw.trim();
     if (!line || phase !== 'idle') return;
+    setInputHistory((prev) => (prev.at(-1) === line ? prev : [...prev, line]));
     // Only a bare word after the slash is a command — "/Users/nick/…" or
     // "/tmp/file.py" in a message is a path, not a command.
     const firstToken = line.split(/\s+/, 1)[0];
@@ -365,7 +367,7 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
           onDone={(m) => void onModelDone(m)}
         />
       ) : null}
-      {phase === 'idle' ? <InputBox onSubmit={onSubmit} /> : null}
+      {phase === 'idle' ? <InputBox onSubmit={onSubmit} history={inputHistory} /> : null}
     </Box>
   );
 }

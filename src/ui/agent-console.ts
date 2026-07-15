@@ -1,6 +1,7 @@
 import chalk from 'chalk';
 import { confirm } from '@inquirer/prompts';
 import type { AgentEvents } from '../agent/loop.js';
+import { renderMarkdownAnsi } from './markdown.js';
 
 export function diffLineColor(line: string): 'green' | 'red' | 'cyan' | null {
   if (line.startsWith('+++') || line.startsWith('---')) return null;
@@ -55,7 +56,7 @@ function indent(text: string, pad = '  '): string {
 export function consoleAgentEvents(): AgentEvents {
   return {
     onText(text) {
-      console.log(`\n● ${text.replaceAll('\n', '\n  ')}\n`);
+      console.log(`\n● ${renderMarkdownAnsi(text).replaceAll('\n', '\n  ')}\n`);
     },
     onStatus(text) {
       console.log(chalk.dim(`  ◦ ${text}`));

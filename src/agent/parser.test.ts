@@ -316,6 +316,88 @@ x = 1
     expect(result.toolCalls[0].args.path).toBe('src/config.ts');
   });
 
+  it('unwraps a whole-reply ```markdown wrapper so inner fences pair correctly', () => {
+    const response = `\`\`\`markdown
+# Count Primes
+
+Updated \`calc.py\`:
+
+\`\`\`python
+x = 1
+\`\`\`
+
+Let me know if you need anything else!
+\`\`\``;
+    const result = parseToolCalls(response, { codeBlockWriteFallback: true });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({ tool: 'Write', args: { path: 'calc.py', content: 'x = 1\n' } }),
+    ]);
+    expect(result.text).not.toContain('```markdown');
+    expect(result.text).toContain('Let me know');
+  });
+
+  it('sniffs code mislabeled as ```markdown and applies it to the unique preferred file', () => {
+    const response = `Here's the revised script:
+
+\`\`\`markdown
+# Main File Revised – Prints First Twenty Prime Numbers
+
+import math
+
+def is_prime(n):
+    return n > 1
+\`\`\`
+The rest of the repository remains unchanged.`;
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['main.py', 'notes.txt'],
+      preferredFiles: ['main.py', 'notes.txt'],
+    });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'Write',
+        args: expect.objectContaining({ path: 'main.py' }),
+      }),
+    ]);
+    expect(result.toolCalls[0].args.content).toContain('import math');
+  });
+
+  it('unwraps a nested real fence inside a mid-reply ```markdown wrapper', () => {
+    const response = `Here:
+
+\`\`\`markdown
+Some intro prose
+
+\`\`\`python
+x = 1
+\`\`\`
+`;
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      preferredFiles: ['calc.py'],
+    });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({ tool: 'Write', args: { path: 'calc.py', content: 'x = 1\n' } }),
+    ]);
+  });
+
+  it('refuses to write markdown prose into a source file', () => {
+    const response =
+      'Updated `calc.py`:\n\n```markdown\n# Notes\n\nThis explains the fix in prose.\n```';
+    expect(parseToolCalls(response, { codeBlockWriteFallback: true }).toolCalls).toEqual([]);
+  });
+
+  it('still writes markdown prose into a markdown file', () => {
+    const response = 'Updated `NOTES.md`:\n\n```markdown\n# Notes\n\nhello\n```';
+    const result = parseToolCalls(response, { codeBlockWriteFallback: true });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'Write',
+        args: { path: 'NOTES.md', content: '# Notes\n\nhello\n' },
+      }),
+    ]);
+  });
+
   it('falls through to the code-block layer when XML names only unknown tools', () => {
     const response = `<minerva_tool name="RunTests">
 <command>pytest</command>

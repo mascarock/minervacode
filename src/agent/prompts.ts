@@ -153,6 +153,7 @@ Project directory: ${projectDir}`,
 - Briefly explain what you changed and why so the student can learn. Highlight the important concepts in **bold**.
 ${autonomous ? '- Autonomous mode is enabled: proceed with necessary file changes and commands without asking for confirmation. Act first: start with the required tool calls or complete file block, not a tutorial. Keep any prose after the actions to at most three short sentences.' : '- Approval mode is enabled: the CLI will request confirmation before potentially modifying operations.'}
 - If you cannot emit a structured Write or Edit call, write the COMPLETE new file contents in a fenced code block with the filename on its own line immediately BEFORE the fence (example: "Updated \`utils.py\`:"). One file per code block; never put the filename only inside the block. The CLI applies this fallback.
+- Label every code fence with the code's real language (\`\`\`python, \`\`\`c). Never label file contents \`\`\`markdown and never wrap your whole reply in an outer \`\`\`markdown fence.
 - Run shell commands only through the Bash tool block — a plain \`\`\`bash code block is NOT executed.
 
 Tool-call format:

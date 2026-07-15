@@ -2,6 +2,8 @@ import { Box, Static, Text } from 'ink';
 import type { SessionInfo } from '../types.js';
 import { Welcome } from './Welcome.js';
 import { DiffText } from './DiffText.js';
+import { Markdown } from './Markdown.js';
+import { ACCENT } from './theme.js';
 
 export type Entry =
   | { id: number; kind: 'welcome'; info: SessionInfo; extra?: string[] }
@@ -31,13 +33,11 @@ function EntryView({ entry }: { entry: Entry }) {
       return (
         <Box>
           <Box marginRight={1}>
-            <Text>●</Text>
+            <Text color={ACCENT}>●</Text>
           </Box>
-          <Box flexGrow={1}>
-            <Text>
-              {entry.text || <Text dimColor>(no response)</Text>}
-              {entry.interrupted ? <Text dimColor> · interrupted</Text> : null}
-            </Text>
+          <Box flexDirection="column" flexGrow={1}>
+            {entry.text ? <Markdown text={entry.text} /> : <Text dimColor>(no response)</Text>}
+            {entry.interrupted ? <Text dimColor>· interrupted</Text> : null}
           </Box>
         </Box>
       );

@@ -1,7 +1,37 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 — 2026-07-15
 
+- In-line cursor editing in the TUI input: ←/→ move the caret, typing and
+  paste insert at the caret, Backspace/fn+Delete delete around it, Home/End
+  and Ctrl+A/E jump to the edges, Ctrl+U/K kill to start/end, Ctrl+W
+  deletes the previous word.
+
+## 0.3.1 — 2026-07-15
+
+- Fix paste in the TUI input: pasted text (including multi-line snippets)
+  is now inserted into the prompt via bracketed paste instead of instantly
+  submitting the first line and discarding the rest. Enter still sends the
+  message; newlines in the pasted content are preserved.
+- Recall previously sent messages with ↑/↓ in the input (shell-style
+  history): ↑ walks back, ↓ walks forward and restores the in-progress
+  draft; editing a recalled message turns it into the current draft.
+
+## 0.3.0 — 2026-07-15
+
+- Render assistant replies as formatted markdown in the TUI and one-shot
+  console: headings, gutter-bordered code blocks with a language label,
+  bullet/ordered lists, quotes, and inline bold/italic/`code` styling,
+  instead of raw markdown source.
+- Handle replies wrapped in a ` ```markdown ` fence: unwrap whole-reply
+  wrappers, extract the real nested fence, and language-sniff mislabelled
+  code so the code-block Write fallback still applies the file change
+  (previously such replies produced no file write at all). Markdown prose
+  is never written into source files.
+- Anchor fence closing to bare ``` lines so nested fences no longer split
+  into mangled blocks.
+- Tell the model to label fences with the code's real language and never
+  use ` ```markdown ` wrappers.
 - Reposition the product as an **assisted coding companion**: measured 7B
   limitations are now stated in the README, `--help`, and end-of-run UX, and
   `--auto` is labelled experimental. Failed autonomous runs keep rolling back

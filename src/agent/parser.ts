@@ -1,3 +1,5 @@
+import { unwrapMarkdownWrapper } from '../ui/markdown.js';
+
 export type ToolCallSource = 'xml' | 'json' | 'codeblock';
 
 export interface ParsedToolCall {
@@ -33,7 +35,10 @@ export interface ParseOptions {
 const XML_BLOCK = /<minerva_tool\s+name="([^"]+)"\s*>([\s\S]*?)<\/minerva_tool>/g;
 const XML_ARG = /<(\w+)>([\s\S]*?)<\/\1>/g;
 const JSON_BLOCK = /```json\s*\n([\s\S]*?)```/g;
-const CODE_BLOCK = /```([^\s`]*)[^\S\n]*\n([\s\S]*?)```/g;
+// The closing fence must be a bare ``` on its own line — otherwise a nested
+// fence opener (```python inside a ```markdown wrapper) ends the block early
+// and the content between two real blocks gets parsed as a third one.
+const CODE_BLOCK = /```([^\s`]*)[^\S\n]*\n([\s\S]*?)^[ \t]{0,3}```[^\S\n]*$/gm;
 const FILENAME = /([\w./-]+\.[A-Za-z0-9]{1,6})/g;
 
 /**
@@ -173,9 +178,41 @@ const LANGUAGE_EXTENSIONS: Record<string, Set<string>> = {
   java: new Set(['java']),
   go: new Set(['go']),
   rust: new Set(['rs']),
+  c: new Set(['c', 'h']),
+  cpp: new Set(['cpp', 'cc', 'cxx', 'hpp', 'h']),
   html: new Set(['html']),
   css: new Set(['css', 'scss']),
+  markdown: new Set(['md', 'markdown']),
+  md: new Set(['md', 'markdown']),
 };
+
+/**
+ * Guesses the language of code the model mislabeled as ```markdown. Weak
+ * models use that label as a generic wrapper around real file contents.
+ * Only unambiguous structural signals count; prose returns null.
+ */
+function sniffCodeLanguage(content: string): string | null {
+  if (
+    /^\s*(?:def\s+\w+\s*\(|class\s+\w+\s*[:(]|from\s+[\w.]+\s+import\s|import\s+[\w.]+(?:\s*,\s*[\w.]+)*\s*$)/m.test(
+      content,
+    )
+  ) {
+    return 'python';
+  }
+  if (/^\s*#include\s*[<"]/m.test(content)) return 'c';
+  if (/\b(?:public|private)\s+(?:static\s+)?(?:class|void|int|String)\b/.test(content)) {
+    return 'java';
+  }
+  if (/^\s*(?:package\s+main\b|func\s+\w+\s*\()/m.test(content)) return 'go';
+  if (
+    /^\s*(?:export\s+(?:default\s+)?\w+|const\s+\w+\s*=|let\s+\w+\s*=|function\s+\w+\s*\()/m.test(
+      content,
+    )
+  ) {
+    return 'javascript';
+  }
+  return null;
+}
 
 function uniquePreferredPath(lang: string, preferredFiles?: string[]): string | undefined {
   if (!preferredFiles?.length) return undefined;
@@ -194,8 +231,23 @@ function parseCodeBlockLayer(
 ): ParsedToolCall[] {
   const calls: ParsedToolCall[] = [];
   for (const match of response.matchAll(CODE_BLOCK)) {
-    const [raw, info, content] = match;
+    const [raw, info, fenced] = match;
     let lang = info;
+    let content = fenced;
+    let markdownProse = false;
+    // ```markdown is usually a wrapper around real content, not a request
+    // to write a .md file: unwrap a nested fence, or sniff the language.
+    if (/^(?:markdown|md)$/i.test(info)) {
+      const nested = content.match(/(?:^|\n)```([^\s`]*)[^\S\n]*\n([\s\S]*)$/);
+      if (nested) {
+        lang = nested[1];
+        content = nested[2];
+      } else {
+        const sniffed = sniffCodeLanguage(content);
+        if (sniffed) lang = sniffed;
+        else markdownProse = true;
+      }
+    }
     const index = match.index ?? 0;
     const before = response.slice(0, index).trimEnd();
     // The filename usually sits right above the fence, but weaker models
@@ -231,6 +283,8 @@ function parseCodeBlockLayer(
     path ??= uniquePreferredPath(lang, preferredFiles);
 
     if (!path) continue;
+    // Markdown prose only ever belongs in markdown/plain-text files.
+    if (markdownProse && !/\.(?:md|markdown|txt)$/i.test(path)) continue;
     // Shell/output fences hold commands, not file contents.
     const mislabeledCSource =
       /\.(?:c|cc|cpp|cxx)$/i.test(path) &&
@@ -272,7 +326,7 @@ export function parseToolCalls(response: string, options: ParseOptions = {}): Pa
   const knowsTool = (name: string) =>
     !options.knownTools || options.knownTools.some((t) => t.toLowerCase() === name.toLowerCase());
 
-  response = closeUnfinishedFence(response);
+  response = closeUnfinishedFence(unwrapMarkdownWrapper(response));
   let calls = parseXmlLayer(response);
   // XML blocks that only name hallucinated tools must not shadow the
   // fallback layers — but still strip them from the visible text.
