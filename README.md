@@ -1,8 +1,10 @@
 # Minerva CLI
 
-A terminal chat client and **coding agent** for [Chat Minerva](https://chatminerva.org) — the Italian AI assistant based on the Minerva LLM (Sapienza NLP & Babelscape).
+A terminal chat client and **assisted coding companion** for [Chat Minerva](https://chatminerva.org) — the Italian AI assistant based on the Minerva LLM (Sapienza NLP & Babelscape).
 
-Chat Minerva runs on **Open WebUI v0.7.2**. This CLI lets you log in and chat from a Claude Code-style terminal UI, and lets Minerva **write, execute, and review** code in your project: it applies changes, runs your tests to verify them, reviews its own diff, and fixes what it finds — every change shown as a diff you approve first (assisted mode) or applied autonomously (`--auto`).
+Chat Minerva runs on **Open WebUI v0.7.2**. This CLI lets you log in and chat from a Claude Code-style terminal UI, and lets Minerva propose, apply, and check code changes in your project: every change is shown as a diff you approve (assisted mode, the default and recommended way to use it), and the CLI — not the model — runs your tests to verify the result.
+
+**Honest expectations:** Minerva is a **7B model without native tool calling**. It is genuinely useful for explaining code, working through small Python homework, and proposing focused fixes that you review. It is **not** a reliable autonomous agent: in our live testing it could not once produce a compilable C program (0 of 28 attempts, even with error feedback), and some runnable Python attempts printed wrong results. The CLI is built around that reality — deterministic verification, honest failure reporting, and rollback — instead of pretending otherwise.
 
 ![Auto mode: write → verify → review](assets/demo-agent.svg)
 
@@ -87,7 +89,7 @@ Slash commands inside the REPL:
 | `/logout` | Clear saved credentials |
 | `/exit` | Quit |
 
-### Coding agent (per studenti)
+### Coding companion (per studenti)
 
 Point Minerva at your homework folder and ask it to explain or fix things:
 
@@ -101,11 +103,16 @@ too. Good for learning: you see and approve every change.
 
 ![Assisted mode approval prompt](assets/demo-assisted.svg)
 
-**Auto mode** — the full agentic loop, no questions asked:
+**Auto mode (experimental)** — the full agentic loop, no questions asked:
 
 ```bash
 minervacli --auto --project-dir ~/compiti "scrivi i test per utils.py"
 ```
+
+Treat `--auto` as a best-effort attempt, not a promise: the 7B frequently
+cannot complete a task unaided, and when that happens the CLI says so,
+rolls the project back, and exits nonzero — it never claims success it
+did not verify. Assisted mode is the recommended default.
 
 1. **Write** — Minerva's edits are applied directly (structured tool calls
    or full-file code blocks). Writes to test files are refused unless your
@@ -119,10 +126,16 @@ minervacli --auto --project-dir ~/compiti "scrivi i test per utils.py"
    `.minervacli.md` → the `package.json` `test`, `typecheck`, or `build`
    script (npm/yarn/pnpm/bun detected from the lockfile) → `pytest` /
    `unittest` if test files exist → `tsc --noEmit` if `tsconfig.json`
-   exists → a syntax check of the changed files.
-3. **Review** — when Minerva stops, the CLI asks it to review its own
-   accumulated diff (tracing each changed function on a concrete input);
-   `[BUG]` findings trigger one more fix cycle.
+   exists → compile **and run** a requested C/C++ program when the request
+   asks for execution → a syntax check of the changed files. At the end of a
+   verified run the CLI prints the command and its real output, so you can
+   confirm the program actually printed what you asked for — "it compiled
+   and exited 0" is not the same as "it is correct".
+3. **Review (advisory)** — when Minerva stops, the CLI asks it to review its
+   own accumulated diff (tracing each changed function on a concrete input).
+   Findings are shown for you to judge but never applied automatically: in
+   live testing the 7B reviewer regularly hallucinated bugs, and letting it
+   "fix" them destroyed verified working code.
 
 If a one-shot `--auto` run ends incomplete or with failed verification, the
 CLI **rolls back every file the run changed or created**, prints why, and
@@ -199,6 +212,23 @@ it honest:
   "do not modify tests" are enforced, and focused fixes cannot invent files
   or erase unrelated top-level definitions. A mutating one-shot request that
   produces no applicable change exits nonzero instead of claiming success.
+
+### Measured limitations
+
+So you know what you're getting (live `chatminerva.org` testing, July 2026):
+
+- **C**: the model could not produce a single compilable C program in
+  28 attempts across prompt styles and temperatures — including retries
+  that fed the exact compiler errors back. Typical failures: calling an
+  `is_prime` helper it never defines, `bool`/`sqrt` without headers,
+  undeclared loop variables. `--auto` on a C task will most likely roll
+  back and exit 1. That is by design: an honest failure, not a broken tool.
+- **Python**: in a small four-attempt probe, two scripts were correct and two
+  printed wrong values; later smoke tests showed the same mixed behavior.
+  The CLI shows the verified program output at the end of the run precisely
+  because exit codes cannot prove correctness — read it.
+- **Reviews** are advisory: a 7B cannot reliably trace semantics, so review
+  findings never override deterministic verification.
 
 Expect to guide it, and keep assisted mode on while you're learning.
 

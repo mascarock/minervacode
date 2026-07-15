@@ -210,7 +210,7 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
       return push({
         kind: 'system',
         text: next
-          ? 'Auto mode on — edits and shell commands run without asking.'
+          ? 'Auto mode on (experimental) — edits and shell commands run without asking. A 7B model often cannot finish unaided; unverified runs are reported honestly.'
           : 'Assisted mode — every change needs your approval.',
       });
     }

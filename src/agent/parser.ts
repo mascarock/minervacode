@@ -33,7 +33,7 @@ export interface ParseOptions {
 const XML_BLOCK = /<minerva_tool\s+name="([^"]+)"\s*>([\s\S]*?)<\/minerva_tool>/g;
 const XML_ARG = /<(\w+)>([\s\S]*?)<\/\1>/g;
 const JSON_BLOCK = /```json\s*\n([\s\S]*?)```/g;
-const CODE_BLOCK = /```(\w*)[^\S\n]*\n([\s\S]*?)```/g;
+const CODE_BLOCK = /```([^\s`]*)[^\S\n]*\n([\s\S]*?)```/g;
 const FILENAME = /([\w./-]+\.[A-Za-z0-9]{1,6})/g;
 
 /**
@@ -194,14 +194,24 @@ function parseCodeBlockLayer(
 ): ParsedToolCall[] {
   const calls: ParsedToolCall[] = [];
   for (const match of response.matchAll(CODE_BLOCK)) {
-    const [raw, lang, content] = match;
+    const [raw, info, content] = match;
+    let lang = info;
     const index = match.index ?? 0;
     const before = response.slice(0, index).trimEnd();
     // The filename usually sits right above the fence, but weaker models
     // often slip an explanation sentence in between — scan a few lines back.
     const lines = before.split('\n').filter((l) => l.trim()).slice(-3).reverse();
     let path: string | undefined;
+    // Small models often put the destination filename in the fence info
+    // string (` ```primes.c `) instead of a language (` ```c `). Treat that
+    // explicit path as stronger than nearby prose and infer the language from
+    // its extension for shell-fence and preferred-file checks below.
+    if (info.includes('.') && isWritablePath(info, knownFiles)) {
+      path = info;
+      lang = info.split('.').at(-1) ?? '';
+    }
     for (const line of lines) {
+      if (path) break;
       path = pickFilename(line, knownFiles);
       if (path) break;
     }
@@ -222,7 +232,15 @@ function parseCodeBlockLayer(
 
     if (!path) continue;
     // Shell/output fences hold commands, not file contents.
-    if (NON_FILE_LANGS.has(lang.toLowerCase()) && !/\.(sh|bash)$/.test(path)) continue;
+    const mislabeledCSource =
+      /\.(?:c|cc|cpp|cxx)$/i.test(path) &&
+      /^\s*#include\s*[<"][^>"\n]+[>"]/m.test(body) &&
+      /\b(?:int|void)\s+main\s*\(/s.test(body);
+    if (
+      NON_FILE_LANGS.has(lang.toLowerCase()) &&
+      !/\.(sh|bash)$/.test(path) &&
+      !mislabeledCSource
+    ) continue;
 
     const canonical = canonicalKnownPath(path, knownFiles);
     if (canonical === null) continue; // ambiguous — let the nudge ask for a full path
@@ -237,10 +255,24 @@ function parseCodeBlockLayer(
   return calls;
 }
 
+/**
+ * Closes a trailing fence the model never closed (it stopped generating or
+ * rambled off). Without this the final — often only — code block is lost.
+ */
+function closeUnfinishedFence(response: string): string {
+  const delimiters = response.match(/```/g)?.length ?? 0;
+  if (delimiters % 2 === 0) return response;
+  // Only a fence that actually started content can be closed meaningfully.
+  const last = response.lastIndexOf('```');
+  if (!response.slice(last).includes('\n')) return response;
+  return `${response.replace(/\n?$/, '\n')}\`\`\``;
+}
+
 export function parseToolCalls(response: string, options: ParseOptions = {}): ParseResult {
   const knowsTool = (name: string) =>
     !options.knownTools || options.knownTools.some((t) => t.toLowerCase() === name.toLowerCase());
 
+  response = closeUnfinishedFence(response);
   let calls = parseXmlLayer(response);
   // XML blocks that only name hallucinated tools must not shadow the
   // fallback layers — but still strip them from the visible text.

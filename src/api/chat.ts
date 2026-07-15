@@ -4,6 +4,7 @@ import type { ChatMessage } from '../types.js';
 export interface StreamChatOptions {
   onChunk?: (text: string) => void;
   signal?: AbortSignal;
+  timeoutMs?: number;
 }
 
 function isAbortError(err: unknown): boolean {
@@ -17,16 +18,32 @@ export async function streamChat(
   messages: ChatMessage[],
   options: StreamChatOptions = {},
 ): Promise<string> {
-  const { onChunk, signal } = options;
-  const res = await client.postStream(
-    '/api/chat/completions',
-    {
-      model: client.model,
-      messages,
-      stream: true,
-    },
-    signal,
-  );
+  const { onChunk, signal, timeoutMs = 60_000 } = options;
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+  let res: Response;
+  try {
+    res = await client.postStream(
+      '/api/chat/completions',
+      {
+        model: client.model,
+        messages,
+        stream: true,
+        // Coding-agent turns should be reproducible and concise. The platform
+        // default is tuned for conversational variety, which makes a small
+        // model much more likely to invent APIs or ramble past a closing fence.
+        temperature: 0.1,
+        max_tokens: 2048,
+      },
+      requestSignal,
+    );
+  } catch (err) {
+    if (isAbortError(err) && signal?.aborted) return '';
+    if (timeoutSignal.aborted && !signal?.aborted) {
+      throw new Error(`Model response timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  }
 
   if (!res.body) {
     throw new Error('No response body from chat API');
@@ -68,8 +85,11 @@ export async function streamChat(
       }
     }
   } catch (err) {
-    if (isAbortError(err)) {
+    if (isAbortError(err) && signal?.aborted) {
       return fullText;
+    }
+    if (timeoutSignal.aborted && !signal?.aborted) {
+      throw new Error(`Model response timed out after ${timeoutMs}ms`);
     }
     throw err;
   }

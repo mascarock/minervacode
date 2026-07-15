@@ -11,7 +11,11 @@ import { needsApproval, type PermissionMode } from './permissions.js';
 import { buildPreview, filePatch, readIfExists } from './preview.js';
 import type { NetChange } from './rollback.js';
 import { runReview } from './review.js';
-import { detectVerifyCommand, runVerification } from './verify.js';
+import {
+  detectVerifyCommand,
+  requestRequiresExecution,
+  runVerification,
+} from './verify.js';
 import { compactMessages } from './compact.js';
 import { buildRepoMap } from './repo-map.js';
 import {
@@ -28,7 +32,9 @@ import {
 export const MAX_TURNS = 20;
 export const MAX_CALLS_PER_TURN = 3;
 /** Harness-run verification commands per agent run. */
-export const MAX_VERIFY_RUNS = 3;
+export const MAX_VERIFY_RUNS = 5;
+const AGENT_ACKNOWLEDGEMENT =
+  'Understood. I will act directly with the available tools, create explicitly requested new files, and verify the real result before reporting completion.';
 
 /** Commands that count as the model verifying its own changes. */
 const VERIFYISH_COMMAND =
@@ -92,6 +98,17 @@ export function requestExpectsChanges(prompt: string): boolean {
   return !INFORMATIONAL_REQUEST.test(prompt) && EXPECTS_FILE_CHANGES.test(prompt);
 }
 
+const EXPLICIT_SOURCE_PATH =
+  /(?:^|[\s`"'([{])((?:\.\/)?(?:[\w@+.-]+\/)*[\w@+.-]+\.(?:[cm]?[jt]sx?|py|go|rs|java|c|cc|cpp|cxx|h|hpp))(?=$|[\s`"',;:!?)\]}]|\.(?:\s|$))/gi;
+
+/** Source paths the student wrote literally in the request, in request order. */
+export function requestExplicitSourcePaths(prompt: string): string[] {
+  const paths = [...prompt.matchAll(EXPLICIT_SOURCE_PATH)].map((match) =>
+    match[1].replace(/^\.\//, ''),
+  );
+  return [...new Set(paths)];
+}
+
 export interface ToolCallEvent {
   tool: Tool;
   input: Record<string, unknown>;
@@ -123,7 +140,13 @@ export interface AgentOptions {
   changeLog?: ChangeLog;
 }
 
-export type AgentStatus = 'completed' | 'aborted' | 'turn-limit' | 'no-change';
+export type AgentStatus =
+  | 'completed'
+  | 'aborted'
+  | 'turn-limit'
+  | 'no-change'
+  | 'requirements-unmet'
+  | 'model-error';
 
 export interface AgentResult {
   /** Updated conversation history (without the system prompt). */
@@ -134,8 +157,17 @@ export interface AgentResult {
   status: AgentStatus;
   /** Outcome of the last verification run; null when none was needed. */
   verified: boolean | null;
+  /** Last harness-run verification, as evidence for the end-of-run report. */
+  verification: VerificationEvidence | null;
   /** Net first-to-final contents per changed file, for diffs and rollback. */
   netChanges: NetChange[];
+}
+
+export interface VerificationEvidence {
+  command: string;
+  output: string;
+  source: string;
+  ok: boolean;
 }
 
 interface FileChange extends AppliedChange {
@@ -195,8 +227,8 @@ const ACTION_CLAIM =
   /\b(?:i(?:'ve| have)?\s+(?:fixed|updated|changed|corrected|modified|implemented)|ho\s+(?:corretto|aggiornato|modificato|sistemato|implementato))\b/i;
 
 /** One-time correction when the model showed code but nothing was applicable. */
-function formatNudge(projectFiles: string[]): string {
-  const example = projectFiles.find((f) => !f.endsWith('/')) ?? 'main.py';
+function formatNudge(projectFiles: string[], requiredPaths: string[] = []): string {
+  const example = requiredPaths[0] ?? projectFiles.find((f) => !f.endsWith('/')) ?? 'main.py';
   return `I could not apply anything from that reply. To change a file, either emit a structured tool call:
 
 <minerva_tool name="Write">
@@ -227,6 +259,13 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   ]);
   const projectFiles = repoMap.files;
   const knownProjectFiles = new Set(projectFiles.map((file) => file.replace(/^\.\//, '')));
+  // A path mentioned as context is not automatically an instruction to
+  // create it (for example, "fix calc.py; the error mentions missing.py").
+  // Only enforce absent paths when the request actually authorizes creating
+  // a file.
+  const requiredNewPaths = requestAllowsNewFile(opts.prompt)
+    ? requestExplicitSourcePaths(opts.prompt).filter((file) => !knownProjectFiles.has(file))
+    : [];
   const projectHasSourceFiles = projectFiles.some((file) => SOURCE_FILE_PATH.test(file));
   const { files: fileContents, skipped } = await loadProjectFileContents(
     opts.projectDir,
@@ -259,17 +298,28 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       if (!baseline.ok) initialVerification = { command: cmd.command, output: baseline.output };
     }
   }
+  const requestedCProgram =
+    requestRequiresExecution(opts.prompt) &&
+    requiredNewPaths.some((file) => /\.(?:c|cc|cpp|cxx)$/i.test(file));
+  const acceptanceRequirements = requiredNewPaths.length
+    ? `\n\nHard acceptance requirement: create the exact requested path${requiredNewPaths.length === 1 ? '' : 's'} ${requiredNewPaths.join(', ')}. Do not substitute another filename.${requestRequiresExecution(opts.prompt) ? ' This is a small standalone program: keep each file under 80 lines, use direct standard-language control flow, and emit the complete file action now before any explanation.' : ''}${requestedCProgram ? ' C/C++ hygiene: use a conventional main entry point, include every standard header you use, keep identifier casing consistent, and prefer small bounded loops and helpers over recursion, variable-length arrays, or pointer tricks.' : ''}`
+    : '';
   const userContent = `${languageInstruction(opts.language)}\n\n${buildTurnPrompt({
     request: opts.prompt,
     repositoryMap: repoMap.map,
     fileContents,
     skippedFiles: skipped,
     initialVerification,
-  })}`;
+  })}${acceptanceRequirements}`;
 
   let messages: ChatMessage[] = [
     ...opts.history,
-    ...(firstTurn ? [{ role: 'user' as const, content: instructions }] : []),
+    ...(firstTurn
+      ? [
+          { role: 'user' as const, content: instructions },
+          { role: 'assistant' as const, content: AGENT_ACKNOWLEDGEMENT },
+        ]
+      : []),
     { role: 'user', content: userContent },
   ];
   let finalText = '';
@@ -280,9 +330,17 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   /** Files changed since the last verification (harness- or model-run). */
   let unverified: string[] = [];
   // Object property so the closure assignment survives TS narrowing.
-  const verifyState = { last: null as boolean | null };
+  const verifyState = {
+    last: null as boolean | null,
+    evidence: null as VerificationEvidence | null,
+  };
   let verifyRuns = 0;
+  let changeSerial = 0;
+  let lastVerifySerial = -1;
+  let failedVerificationNudgeSerial = -1;
+  let failedVerificationNudges = 0;
   let nudged = false;
+  let requirementsNudges = 0;
   let reviewed = false;
   let compactionReported = false;
 
@@ -297,7 +355,29 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     }
   };
 
+  const focusFailedRepair = async (command: string, output: string) => {
+    const currentFiles = await Promise.all(
+      [...new Set(unverified)].slice(0, 3).map(async (file) => {
+        try {
+          const content = await readIfExists(resolveInProject(opts.projectDir, file));
+          return `=== ${file} ===\n${content.slice(0, 24 * 1024)}`;
+        } catch {
+          return `=== ${file} ===\n(unavailable)`;
+        }
+      }),
+    );
+    messages = [
+      { role: 'user', content: instructions },
+      { role: 'assistant', content: AGENT_ACKNOWLEDGEMENT },
+      {
+        role: 'user',
+        content: `${languageInstruction(opts.language)}\n\nFocused autonomous repair.\nOriginal student request: ${opts.prompt}\n${requiredNewPaths.length ? `Required output path: ${requiredNewPaths.join(', ')}\n` : ''}The current source below failed a REAL verification command. Fix the actual error or timeout with the simplest complete implementation. Emit the Write/Edit action first, with no tutorial and no partial snippets.\n\n${currentFiles.join('\n\n')}\n\nVerification failure:\n$ ${command}\n${output}`,
+      },
+    ];
+  };
+
   const recordChange = (change: FileChange) => {
+    changeSerial++;
     changes.push({ path: change.path, patch: change.patch });
     opts.changeLog?.add({ path: change.path, patch: change.patch });
     unverified.push(change.path);
@@ -319,9 +399,19 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
    */
   const harnessVerify = async (results: string[]): Promise<boolean> => {
     if (!auto || !unverified.length || verifyRuns >= MAX_VERIFY_RUNS) return false;
+    // A failed check is only useful again after the source changed. Re-running
+    // the identical command against identical files burns the retry budget and
+    // gives the model no new information.
+    if (verifyState.last === false && lastVerifySerial === changeSerial) return false;
     // Re-list: the run may have created test files that change the choice.
     const files = await listProjectFiles(opts.projectDir);
-    const cmd = await detectVerifyCommand(opts.projectDir, files, unverified);
+    const cmd = await detectVerifyCommand(
+      opts.projectDir,
+      files,
+      unverified,
+      undefined,
+      opts.prompt,
+    );
     if (!cmd) {
       // No verifier applies to these paths (e.g. docs) — they can never be
       // checked, so they must not keep the run marked unverified forever.
@@ -340,12 +430,15 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     if (event) opts.events.onToolEnd({ ...event, ok, result: output });
 
     verifyState.last = ok;
+    verifyState.evidence = { command: cmd.command, output, source: cmd.source, ok };
+    lastVerifySerial = changeSerial;
     // Only a passing check clears the dirty set — a failed one stays due
     // so the stop-branch retries after the model's next fix attempt.
     if (ok) unverified = [];
+    else await focusFailedRepair(cmd.command, output);
     const guidance = ok
       ? 'Verification passed. If the request is complete, briefly summarize what you changed — do not repeat file contents.'
-      : 'This verification command failed. Diagnose the output above and fix the SOURCE files — do not weaken or delete tests. The check will run again.';
+      : `This verification command failed. Use the REAL error output above and apply a source fix now — do not merely explain it, do not weaken tests, and do not send partial snippets.${requiredNewPaths.length ? ` Replace the required ${requiredNewPaths.join(', ')} with a complete minimal implementation when a whole-file rewrite is needed.` : ''} The check will run again only after a file changes.`;
     results.push(
       `${formatToolResult('Bash', `$ ${cmd.command}\n${output}`, ok)}\n\n${guidance}`,
     );
@@ -354,7 +447,16 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     compactContext();
-    const response = await streamChat(client, messages, { signal: opts.signal });
+    let response: string;
+    try {
+      response = await streamChat(client, messages, { signal: opts.signal });
+    } catch (err) {
+      status = 'model-error';
+      const message = err instanceof Error ? err.message : String(err);
+      finalText = message;
+      opts.events.onStatus?.(`⚠ Model request failed: ${message}`);
+      break;
+    }
     messages.push({ role: 'assistant', content: response });
 
     // The code-block fallback is the primary write path for ChatMinerva —
@@ -364,7 +466,9 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       codeBlockWriteFallback: true,
       knownFiles: projectFiles,
       preferredFiles: requestExpectsChanges(opts.prompt)
-        ? repoMap.contextFiles.filter((file) => !TEST_FILE_PATH.test(file))
+        ? requiredNewPaths.length
+          ? requiredNewPaths
+          : repoMap.contextFiles.filter((file) => !TEST_FILE_PATH.test(file))
         : undefined,
       knownTools: tools.map((t) => t.name),
     });
@@ -387,8 +491,53 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         (response.includes('```') || ACTION_CLAIM.test(response))
       ) {
         nudged = true;
-        messages.push({ role: 'user', content: formatNudge(projectFiles) });
+        messages.push({
+          role: 'user',
+          content: formatNudge(projectFiles, requiredNewPaths),
+        });
         continue;
+      }
+
+      const missingRequiredPaths = requiredNewPaths.filter((file) => !netState.has(file));
+      if (auto && missingRequiredPaths.length) {
+        if (requirementsNudges < 3) {
+          requirementsNudges++;
+          messages = [
+            { role: 'user', content: instructions },
+            { role: 'assistant', content: AGENT_ACKNOWLEDGEMENT },
+            {
+              role: 'user',
+              content: `${languageInstruction(opts.language)}\n\nAutonomous action required. The student explicitly asked you to CREATE ${missingRequiredPaths.join(', ')}, so creating ${missingRequiredPaths.length === 1 ? 'this new file is' : 'these new files is'} allowed. Emit the complete Write action now; do not refuse, explain, ask questions, mention unrelated files, or substitute another path.\nOriginal request: ${opts.prompt}${requestedCProgram ? '\nKeep the standalone C/C++ program under 80 lines with conventional headers, consistent lowercase loop identifiers, simple terminating loops, and no pointer tricks.' : ''}`,
+            },
+          ];
+          continue;
+        }
+        status = 'requirements-unmet';
+        opts.events.onStatus?.(
+          `⚠ Required output ${missingRequiredPaths.join(', ')} was not created.`,
+        );
+        break;
+      }
+
+      if (
+        auto &&
+        unverified.length &&
+        verifyState.last === false &&
+        lastVerifySerial === changeSerial
+      ) {
+        if (failedVerificationNudgeSerial !== changeSerial) {
+          failedVerificationNudgeSerial = changeSerial;
+          failedVerificationNudges = 0;
+        }
+        if (failedVerificationNudges < 3) {
+          failedVerificationNudges++;
+          messages.push({
+            role: 'user',
+            content: 'The previous verification failed and this reply did not apply a source fix. Do not merely explain or repeat code snippets: update the failing file now with a Write or Edit tool call (or one complete filename-labelled file block). Verification will run again only after the file changes.',
+          });
+          continue;
+        }
+        break;
       }
 
       // Changes still unverified when the model stopped — verify them now.
@@ -398,7 +547,16 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         continue;
       }
 
-      // Everything applied and verified — run one self-review pass.
+      // A verifier applies but the current source still has not passed. Do
+      // not self-review or claim completion for a known-broken state.
+      if (unverified.length) break;
+
+      // Everything applied and verified — run one self-review pass. The
+      // review is strictly ADVISORY: a 7B reviewer hallucinates bugs often
+      // enough that letting it trigger a fix cycle destroys verified work
+      // (observed live: a correct, passing script rewritten into garbage).
+      // Deterministic verification stays the only gate; findings are shown
+      // so the student can judge them.
       if (selfReview && auto && netState.size && !reviewed) {
         reviewed = true;
         opts.events.onStatus?.('Reviewing applied changes…');
@@ -406,19 +564,24 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
           .filter(([, s]) => s.before !== s.after)
           .map(([path, s]) => filePatch(path, s.before, s.after))
           .join('\n\n');
-        const review = await runReview(client, {
-          diff,
-          language: opts.language,
-          intent: opts.prompt,
-          signal: opts.signal,
-        });
-        opts.events.onText(`Code review:\n${review.raw}`);
-        if (review.hasBugs) {
-          messages.push({
-            role: 'user',
-            content: `A code review of your applied changes found these problems:\n\n${review.raw}\n\nFix the [BUG] findings now using tool calls or complete file blocks. Ignore [NIT] findings unless trivial.`,
+        try {
+          const review = await runReview(client, {
+            diff,
+            language: opts.language,
+            intent: opts.prompt,
+            signal: opts.signal,
           });
-          continue;
+          opts.events.onText(`Code review (advisory):\n${review.raw}`);
+          if (review.hasBugs) {
+            opts.events.onStatus?.(
+              '⚠ The advisory review flagged possible issues. Double-check them yourself — the reviewer is a 7B model and is often wrong, so verified files were not changed automatically.',
+            );
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          opts.events.onStatus?.(
+            `⚠ Advisory review unavailable: ${message}. Deterministically verified files were left unchanged.`,
+          );
         }
       }
       break;
@@ -446,6 +609,65 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       }
 
       const input = parsed.data as Record<string, unknown>;
+
+      let normalizedInputPath =
+        typeof input.path === 'string' ? input.path.replace(/^\.\//, '') : null;
+      const requiredCaseMatch = normalizedInputPath
+        ? requiredNewPaths.find(
+            (required) => required.toLowerCase() === normalizedInputPath?.toLowerCase(),
+          )
+        : undefined;
+      if (
+        auto &&
+        requiredCaseMatch &&
+        normalizedInputPath !== requiredCaseMatch &&
+        (tool.name === 'Write' || tool.name === 'Edit')
+      ) {
+        input.path = requiredCaseMatch;
+        normalizedInputPath = requiredCaseMatch;
+      }
+      if (
+        auto &&
+        (tool.name === 'Write' || tool.name === 'Edit') &&
+        normalizedInputPath &&
+        SOURCE_FILE_PATH.test(normalizedInputPath) &&
+        !knownProjectFiles.has(normalizedInputPath) &&
+        requiredNewPaths.length &&
+        !requiredNewPaths.includes(normalizedInputPath)
+      ) {
+        const refused = `Refused: the request explicitly requires ${requiredNewPaths.join(', ')}, not ${input.path}. Create the exact requested path and do not invent an alternative source filename.`;
+        opts.events.onToolEnd({
+          tool,
+          input,
+          summary: tool.summarize(input),
+          ok: false,
+          result: refused,
+        });
+        results.push(formatToolResult(tool.name, refused, false));
+        continue;
+      }
+
+      if (
+        auto &&
+        tool.name === 'Write' &&
+        normalizedInputPath &&
+        requiredNewPaths.includes(normalizedInputPath) &&
+        requestRequiresExecution(opts.prompt) &&
+        /\.(?:c|cc|cpp|cxx)$/i.test(normalizedInputPath) &&
+        typeof input.content === 'string' &&
+        !/\b(?:int|void)\s+main\s*\([^)]*\)\s*\{/s.test(input.content)
+      ) {
+        const refused = `Refused: ${input.path} is the requested executable program, but this Write is only a partial snippet and has no complete main function. Send the COMPLETE ${input.path} file in one Write (or use Edit for a focused replacement).`;
+        opts.events.onToolEnd({
+          tool,
+          input,
+          summary: tool.summarize(input),
+          ok: false,
+          result: refused,
+        });
+        results.push(formatToolResult(tool.name, refused, false));
+        continue;
+      }
 
       if (
         auto &&
@@ -489,9 +711,19 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         continue;
       }
 
+      // Preserve-bias (partial-write merging, refusing definition removal)
+      // protects the STUDENT's pre-existing work. A file this run created
+      // has none — merging or refusing there only traps the model with its
+      // own broken first draft instead of letting it rewrite cleanly.
+      const netEntry =
+        typeof input.path === 'string'
+          ? netState.get(input.path) ?? netState.get(input.path.replace(/^\.\//, ''))
+          : undefined;
+      const createdThisRun = netEntry?.existedBefore === false;
+
       // A code-block "file" that only re-states some existing functions is
       // a partial update — merge it instead of wiping the rest of the file.
-      if (call.source === 'codeblock' && tool.name === 'Write') {
+      if (call.source === 'codeblock' && tool.name === 'Write' && !createdThisRun) {
         try {
           const target = resolveInProject(opts.projectDir, String(input.path));
           const merged = mergePartialWrite(
@@ -510,6 +742,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         tool.name === 'Write' &&
         typeof input.path === 'string' &&
         typeof input.content === 'string' &&
+        !createdThisRun &&
         !ALLOWS_DEFINITION_REMOVAL.test(opts.prompt)
       ) {
         try {
@@ -565,7 +798,12 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       }
       // A successful test/build command run by the model counts as its own
       // verification; an `ls` or `echo` does not.
-      if (ok && tool.name === 'Bash' && VERIFYISH_COMMAND.test(String(input.command ?? ''))) {
+      if (
+        ok &&
+        tool.name === 'Bash' &&
+        VERIFYISH_COMMAND.test(String(input.command ?? '')) &&
+        !requestRequiresExecution(opts.prompt)
+      ) {
         unverified = [];
         verifyState.last = true;
       }
@@ -615,5 +853,13 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     opts.events.onStatus?.('⚠ Changes were not successfully verified when the agent stopped.');
   }
 
-  return { history: messages, finalText, changes, status, verified, netChanges };
+  return {
+    history: messages,
+    finalText,
+    changes,
+    status,
+    verified,
+    verification: verifyState.evidence,
+    netChanges,
+  };
 }

@@ -11,12 +11,24 @@ export interface VerifyCommand {
   command: string;
   /** Where the command came from, e.g. `.minervacli.md` or `pytest files`. */
   source: string;
+  /** Optional shorter timeout for directly executed smoke-test programs. */
+  timeoutMs?: number;
 }
 
 /** `- Test: `python -m pytest`` line in the project context file. */
 const CONTEXT_TEST_LINE = /^\s*[-*]?\s*test[^:`]*:\s*`([^`]+)`/im;
 
 const PY_TEST_FILE = /(^|\/)(test_[^/]+\.py|[^/]+_test\.py)$/;
+const REQUIRES_EXECUTION =
+  /\b(?:run|runs|running|execute|executes|executed|executing|launch|esegu\w*|avvi\w*)\b/i;
+const TEST_EXECUTION_PHRASE =
+  /\b(?:run|runs|running|execute|executes|executed|executing|esegu\w*|avvi\w*)\s+(?:the\s+|i\s+|gli\s+|la\s+|le\s+)?tests?\b/gi;
+
+export function requestRequiresExecution(request: string): boolean {
+  // "Run the tests" asks for verification, not for executing a changed
+  // source module as a standalone program.
+  return REQUIRES_EXECUTION.test(request.replace(TEST_EXECUTION_PHRASE, ''));
+}
 
 async function pythonHasPytest(): Promise<boolean> {
   try {
@@ -37,6 +49,12 @@ async function readProjectFile(projectDir: string, rel: string): Promise<string 
 
 function quote(p: string): string {
   return `'${p.replaceAll("'", String.raw`'\''`)}'`;
+}
+
+function requestNamesPath(request: string, file: string): boolean {
+  const normalized = file.replace(/^\.\//, '');
+  const base = path.basename(normalized);
+  return request.includes(normalized) || request.includes(base);
 }
 
 type PackageManager = 'npm' | 'yarn' | 'pnpm' | 'bun';
@@ -64,11 +82,51 @@ export async function detectVerifyCommand(
   projectFiles: string[],
   changedPaths: string[],
   hasPytest: () => Promise<boolean> = pythonHasPytest,
+  request = '',
 ): Promise<VerifyCommand | null> {
+  const uniqueChangedPaths = [...new Set(changedPaths)];
   const context = await readProjectFile(projectDir, PROJECT_CONTEXT_FILE);
   const contextCommand = context?.match(CONTEXT_TEST_LINE)?.[1]?.trim();
   if (contextCommand) {
     return { command: contextCommand, source: PROJECT_CONTEXT_FILE };
+  }
+
+  const changedPy = uniqueChangedPaths.filter((p) => p.endsWith('.py'));
+  const cSources = uniqueChangedPaths.filter((p) => p.endsWith('.c'));
+  const cppSources = uniqueChangedPaths.filter((p) => /\.(?:cpp|cc|cxx)$/.test(p));
+  const executeNamedProgram = requestRequiresExecution(request);
+
+  // An explicit "write X and run X" request must execute X even inside a
+  // repository that has an unrelated package test/build script. Otherwise a
+  // green project test can incorrectly stand in for the requested program.
+  if (
+    changedPy.length === 1 &&
+    executeNamedProgram &&
+    requestNamesPath(request, changedPy[0])
+  ) {
+    return {
+      command: `python3 ${quote(changedPy[0])}`,
+      source: 'compile and run',
+      timeoutMs: 10_000,
+    };
+  }
+  if (cSources.length && executeNamedProgram && cSources.some((p) => requestNamesPath(request, p))) {
+    return {
+      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacli-c.XXXXXX") && trap 'rm -f "$bin"' EXIT && cc -std=c11 -Wall -Wextra -pedantic ${cSources.map(quote).join(' ')} -o "$bin" -lm && "$bin"`,
+      source: 'compile and run',
+      timeoutMs: 10_000,
+    };
+  }
+  if (
+    cppSources.length &&
+    executeNamedProgram &&
+    cppSources.some((p) => requestNamesPath(request, p))
+  ) {
+    return {
+      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacli-cpp.XXXXXX") && trap 'rm -f "$bin"' EXIT && c++ -std=c++17 -Wall -Wextra -pedantic ${cppSources.map(quote).join(' ')} -o "$bin" && "$bin"`,
+      source: 'compile and run',
+      timeoutMs: 10_000,
+    };
   }
 
   const packageManager = detectPackageManager(projectFiles);
@@ -97,7 +155,6 @@ export async function detectVerifyCommand(
     }
   }
 
-  const changedPy = [...new Set(changedPaths.filter((p) => p.endsWith('.py')))];
   // Syntax-check changed files first: test runners skip modules they never
   // import, so a broken file can otherwise slip through unnoticed.
   const compileChanged = changedPy.length
@@ -126,7 +183,7 @@ export async function detectVerifyCommand(
   }
 
   // Changed TypeScript with no scripts — typecheck the project directly.
-  const changedTs = changedPaths.some((p) => /\.(ts|tsx|mts|cts)$/.test(p));
+  const changedTs = uniqueChangedPaths.some((p) => /\.(ts|tsx|mts|cts)$/.test(p));
   if (changedTs && projectFiles.includes('tsconfig.json')) {
     return { command: 'npx tsc --noEmit', source: 'tsconfig.json' };
   }
@@ -138,21 +195,35 @@ export async function detectVerifyCommand(
       source: 'syntax check',
     };
   }
-  const jsFiles = changedPaths.filter((p) => /\.(js|mjs|cjs)$/.test(p));
+  const jsFiles = uniqueChangedPaths.filter((p) => /\.(js|mjs|cjs)$/.test(p));
   if (jsFiles.length) {
     return {
       command: jsFiles.map((f) => `node --check ${quote(f)}`).join(' && '),
       source: 'syntax check',
     };
   }
-  const cFiles = changedPaths.filter((p) => /\.(c|h)$/.test(p));
+  if (cSources.length && requestRequiresExecution(request)) {
+    return {
+      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacli-c.XXXXXX") && trap 'rm -f "$bin"' EXIT && cc -std=c11 -Wall -Wextra -pedantic ${cSources.map(quote).join(' ')} -o "$bin" -lm && "$bin"`,
+      source: 'compile and run',
+      timeoutMs: 10_000,
+    };
+  }
+  const cFiles = uniqueChangedPaths.filter((p) => /\.(c|h)$/.test(p));
   if (cFiles.length) {
     return {
       command: `cc -fsyntax-only ${cFiles.map(quote).join(' ')}`,
       source: 'syntax check',
     };
   }
-  const cppFiles = changedPaths.filter((p) => /\.(cpp|cc|hpp)$/.test(p));
+  if (cppSources.length && requestRequiresExecution(request)) {
+    return {
+      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacli-cpp.XXXXXX") && trap 'rm -f "$bin"' EXIT && c++ -std=c++17 -Wall -Wextra -pedantic ${cppSources.map(quote).join(' ')} -o "$bin" && "$bin"`,
+      source: 'compile and run',
+      timeoutMs: 10_000,
+    };
+  }
+  const cppFiles = uniqueChangedPaths.filter((p) => /\.(cpp|cc|cxx|hpp)$/.test(p));
   if (cppFiles.length) {
     return {
       command: `c++ -fsyntax-only ${cppFiles.map(quote).join(' ')}`,
@@ -175,7 +246,10 @@ export async function runVerification(
   signal?: AbortSignal,
 ): Promise<VerifyOutcome> {
   try {
-    const output = await bashTool.call({ command: cmd.command }, { projectDir, signal });
+    const output = await bashTool.call(
+      { command: cmd.command, timeout_ms: cmd.timeoutMs },
+      { projectDir, signal },
+    );
     return { ok: true, output };
   } catch (err) {
     let output = err instanceof Error ? err.message : String(err);

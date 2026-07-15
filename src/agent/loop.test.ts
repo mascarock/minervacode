@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { MinervaClient } from '../api/client.js';
 import type { ChatMessage } from '../types.js';
 import {
+  MAX_VERIFY_RUNS,
+  requestExplicitSourcePaths,
   requestAllowsNewFile,
   requestExpectsChanges,
   requestAllowsTestEdit,
@@ -119,7 +121,68 @@ describe('requestExpectsChanges', () => {
   });
 });
 
+describe('requestExplicitSourcePaths', () => {
+  it('extracts source paths explicitly named in a request', () => {
+    expect(
+      requestExplicitSourcePaths(
+        'Write a C program in primes.c, then update src/report.ts and run it.',
+      ),
+    ).toEqual(['primes.c', 'src/report.ts']);
+  });
+
+  it('matches a path at the end of a sentence', () => {
+    expect(requestExplicitSourcePaths('Create primes.c. Then compile it.')).toEqual([
+      'primes.c',
+    ]);
+    expect(requestExplicitSourcePaths('Create primes.c.')).toEqual(['primes.c']);
+  });
+});
+
 describe('autonomous agent loop', () => {
+  it('does not create a missing path that was only mentioned as context', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'calc.py'), 'print("ok")\n');
+    const requestBodies: unknown[] = [];
+
+    const result = await runAgent(mockClient(['No change is needed.'], requestBodies), {
+      history: [],
+      prompt: 'Inspect calc.py; the traceback mentions missing.py.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    expect(existsSync(path.join(projectDir, 'missing.py'))).toBe(false);
+    expect(JSON.stringify(requestBodies[0])).not.toContain('Hard acceptance requirement');
+    expect(result.status).toBe('completed');
+  });
+
+  it('returns a model-error result instead of throwing when the API fails', async () => {
+    const projectDir = await tempProject();
+    const events = autoEvents();
+    const statuses: string[] = [];
+    events.onStatus = (text) => statuses.push(text);
+    const client = {
+      model: 'test-model',
+      async postStream() {
+        throw new Error('upstream unavailable');
+      },
+    } as MinervaClient;
+
+    const result = await runAgent(client, {
+      history: [],
+      prompt: 'Create answer.c.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events,
+    });
+
+    expect(result.status).toBe('model-error');
+    expect(statuses.at(-1)).toContain('upstream unavailable');
+  });
+
   it('does not report a mutating request as completed when no change was applied', async () => {
     const projectDir = await tempProject();
     await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
@@ -138,6 +201,124 @@ describe('autonomous agent loop', () => {
 
     expect(result.status).toBe('no-change');
     expect(statuses.at(-1)).toContain('no applicable change');
+  });
+
+  it('rejects an alternative new source file when the request names the required path', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'main.py'), 'print("existing")\n');
+    const requestBodies: unknown[] = [];
+    const responses = [
+      '<minerva_tool name="Write">\n<path>new_main.c</path>\n<content>\nint main(void) { return 0; }\n</content>\n</minerva_tool>',
+      '<minerva_tool name="Write">\n<path>primes.c</path>\n<content>\n#include <stdio.h>\nint main(void) { puts("2 3 5 7 11 13 17 19 23 29"); return 0; }\n</content>\n</minerva_tool>',
+      'Created and executed primes.c.',
+      'LGTM',
+    ];
+
+    const result = await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Write primes.c to print the first 10 primes, compile it, and execute it.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    expect(existsSync(path.join(projectDir, 'new_main.c'))).toBe(false);
+    expect(await readFile(path.join(projectDir, 'primes.c'), 'utf-8')).toContain(
+      '2 3 5 7 11 13 17 19 23 29',
+    );
+    expect(JSON.stringify(requestBodies[1])).toContain('explicitly requires primes.c');
+    expect(JSON.stringify(requestBodies[2])).toContain('cc -std=c11 -Wall -Wextra -pedantic');
+    expect(JSON.stringify(requestBodies[2])).toContain('2 3 5 7 11 13 17 19 23 29');
+    expect(result.status).toBe('completed');
+    expect(result.verified).toBe(true);
+    // The end-of-run report shows this as evidence: what ran and what it printed.
+    expect(result.verification).toMatchObject({ ok: true, source: 'compile and run' });
+    expect(result.verification?.output).toContain('2 3 5 7 11 13 17 19 23 29');
+  });
+
+  it('does not complete when an explicitly requested new file is still missing', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'main.py'), 'print("existing")\n');
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+    const responses = [
+      'Updated `main.py`:\n\n```python\nprint("wrong target")\n```',
+      'Done.',
+      'Still done.',
+    ];
+
+    const result = await runAgent(mockClient(responses), {
+      history: [],
+      prompt: 'Create primes.c and execute it.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      review: false,
+      events,
+    });
+
+    expect(result.status).toBe('requirements-unmet');
+    expect(result.verified).toBe(true);
+    expect(existsSync(path.join(projectDir, 'primes.c'))).toBe(false);
+    expect(statuses.at(-1)).toContain('primes.c');
+  });
+
+  it('refuses partial whole-file writes for a requested executable C program', async () => {
+    const projectDir = await tempProject();
+    const requestBodies: unknown[] = [];
+    const responses = [
+      'Updated `primes.c`:\n\n```c\nint output = 0;\n```',
+      'Updated `Primes.c`:\n\n```c\n#include <stdio.h>\nint main(void) { puts("ok"); return 0; }\n```',
+      'Done.',
+      'LGTM',
+    ];
+
+    const result = await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Create primes.c, compile it, and execute it.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    expect(JSON.stringify(requestBodies[1])).toContain('only a partial snippet');
+    expect(await readFile(path.join(projectDir, 'primes.c'), 'utf-8')).toContain('main(void)');
+    expect(await readdir(projectDir)).toContain('primes.c');
+    expect(await readdir(projectDir)).not.toContain('Primes.c');
+    expect(result.verified).toBe(true);
+  });
+
+  it('lets the model fully rewrite a broken file it created this run', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'notes.md'), 'existing project\n');
+    const responses = [
+      // First draft defines helper() but the rewrite drops it — allowed,
+      // because there is no student work in a file this run created.
+      'Updated `countdown.py`:\n\n```python\ndef helper():\n    pass\n\nhelper2()\n```',
+      'The NameError means helper2 is undefined.',
+      'Updated `countdown.py`:\n\n```python\nfor i in range(5, 0, -1):\n    print(i)\n```',
+      'Done.',
+      'LGTM',
+    ];
+
+    const result = await runAgent(mockClient(responses), {
+      history: [],
+      prompt: 'Create countdown.py that counts 5 to 1 and run it.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    // Neither merged with the broken draft nor refused for dropping helper().
+    expect(await readFile(path.join(projectDir, 'countdown.py'), 'utf-8')).toBe(
+      'for i in range(5, 0, -1):\n    print(i)\n',
+    );
+    expect(result.status).toBe('completed');
+    expect(result.verified).toBe(true);
   });
 
   it('separates stable instructions from a relevance-ranked current repository snapshot', async () => {
@@ -162,13 +343,17 @@ describe('autonomous agent loop', () => {
     const body = requestBodies[0] as { messages: ChatMessage[] };
     // The mock retains the request array by reference, so the completed
     // assistant response is appended after postStream receives it.
-    expect(body.messages.slice(0, 2).map((message) => message.role)).toEqual(['user', 'user']);
+    expect(body.messages.slice(0, 3).map((message) => message.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+    ]);
     expect(body.messages[0].content).toContain('You are Minerva');
     expect(body.messages[0].content).not.toContain('return false');
-    expect(body.messages[1].content).toContain('Repository map');
-    expect(body.messages[1].content).toContain('symbols: validateToken');
-    expect(body.messages[1].content).toContain('=== src/auth.ts ===');
-    expect(body.messages[1].content).toContain('return false');
+    expect(body.messages[2].content).toContain('Repository map');
+    expect(body.messages[2].content).toContain('symbols: validateToken');
+    expect(body.messages[2].content).toContain('=== src/auth.ts ===');
+    expect(body.messages[2].content).toContain('return false');
   });
 
   it('feeds a failing initial test run into the first model request', async () => {
@@ -271,14 +456,15 @@ describe('autonomous agent loop', () => {
     expect(result.changes.map((c) => c.path)).toEqual(['answer.js']);
   });
 
-  it('feeds review BUG findings back for a fix cycle', async () => {
+  it('reports review BUG findings as advisory without a fix cycle', async () => {
     const projectDir = await tempProject();
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
     const responses = [
       'Updated `answer.js`:\n\n```js\nconsole.log(41);\n```',
       'Done.',
       '[BUG] answer.js — prints 41 instead of 42', // review
-      'Updated `answer.js`:\n\n```js\nconsole.log(42);\n```', // fix cycle
-      'Fixed.',
     ];
     const client = mockClient(responses);
 
@@ -288,13 +474,83 @@ describe('autonomous agent loop', () => {
       projectDir,
       permissionMode: 'dontAsk',
       language: 'en',
-      events: autoEvents(),
+      events,
     });
 
-    expect(await readFile(path.join(projectDir, 'answer.js'), 'utf-8')).toBe('console.log(42);\n');
-    // Only one review pass: two Write changes, no second review request.
-    expect(result.changes).toHaveLength(2);
-    expect(result.finalText).toBe('Fixed.');
+    // The verified file is untouched: a 7B review must never trigger a
+    // rewrite of a state that already passed deterministic verification.
+    expect(await readFile(path.join(projectDir, 'answer.js'), 'utf-8')).toBe('console.log(41);\n');
+    expect(result.changes).toHaveLength(1);
+    expect(result.status).toBe('completed');
+    expect(statuses.at(-1)).toContain('advisory review');
+  });
+
+  it('keeps a verified result when the advisory review request fails', async () => {
+    const projectDir = await tempProject();
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+    let calls = 0;
+    const client = {
+      model: 'test-model',
+      async postStream() {
+        calls++;
+        if (calls === 1) {
+          return sseResponse('Updated `answer.js`:\n\n```js\nconsole.log(42);\n```');
+        }
+        if (calls === 2) return sseResponse('Done.');
+        throw new Error('review service unavailable');
+      },
+    } as MinervaClient;
+
+    const result = await runAgent(client, {
+      history: [],
+      prompt: 'Create the answer program.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events,
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.verified).toBe(true);
+    expect(await readFile(path.join(projectDir, 'answer.js'), 'utf-8')).toBe(
+      'console.log(42);\n',
+    );
+    expect(statuses.at(-1)).toContain('Advisory review unavailable');
+  });
+
+  it('waits for a source edit instead of rerunning an unchanged failed verification', async () => {
+    const projectDir = await tempProject();
+    const requestBodies: unknown[] = [];
+    const bashRuns: string[] = [];
+    const events = autoEvents();
+    events.onToolStart = (event) => {
+      if (event.tool.name === 'Bash') bashRuns.push(event.summary);
+    };
+    const responses = [
+      'Updated `answer.c`:\n\n```c\nint main(void) { broken }\n```',
+      'The compiler error means the source must be corrected.',
+      'Updated `answer.c`:\n\n```c\n#include <stdio.h>\nint main(void) { puts("ok"); return 0; }\n```',
+      'Implemented and executed.',
+      'LGTM',
+    ];
+
+    const result = await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Create answer.c, compile it, and execute it.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events,
+    });
+
+    expect(bashRuns).toHaveLength(2);
+    expect(JSON.stringify(requestBodies[2])).toContain(
+      'previous verification failed and this reply did not apply a source fix',
+    );
+    expect(result.status).toBe('completed');
+    expect(result.verified).toBe(true);
   });
 
   it('nudges once when the reply has a fence but no applicable file', async () => {
@@ -536,16 +792,13 @@ describe('autonomous agent loop', () => {
   it('downgrades a stale verified=true when later changes could not be checked', async () => {
     const projectDir = await tempProject();
     await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
-    // Three verified writes exhaust the verify budget; the fourth change
-    // can no longer be checked, so the run must not report verified=true.
-    const responses = [
-      'Updated `calc.py`:\n\n```python\nx = 2\n```',
-      'Updated `calc.py`:\n\n```python\nx = 3\n```',
-      'Updated `calc.py`:\n\n```python\nx = 4\n```',
-      'Updated `calc.py`:\n\n```python\nx = 5\n```',
-      'Done.',
-      'LGTM',
-    ];
+    // One more change than the verification budget can cover must downgrade
+    // the stale passing result instead of claiming the latest state passed.
+    const responses = Array.from(
+      { length: MAX_VERIFY_RUNS + 1 },
+      (_, i) => `Updated \`calc.py\`:\n\n\`\`\`python\nx = ${i + 2}\n\`\`\``,
+    );
+    responses.push('Done.', 'LGTM');
     const client = mockClient(responses);
 
     const result = await runAgent(client, {
@@ -557,7 +810,9 @@ describe('autonomous agent loop', () => {
       events: autoEvents(),
     });
 
-    expect(await readFile(path.join(projectDir, 'calc.py'), 'utf-8')).toBe('x = 5\n');
+    expect(await readFile(path.join(projectDir, 'calc.py'), 'utf-8')).toBe(
+      `x = ${MAX_VERIFY_RUNS + 2}\n`,
+    );
     expect(result.verified).toBe(false);
   });
 

@@ -107,6 +107,11 @@ export async function runChatOnce(
         `\n  ⚠ ${reason} — reverted: ${reverted.join(', ') || '(nothing revertable)'}`,
       ),
     );
+    console.log(
+      chalk.dim(
+        '  Minerva (a 7B model) often cannot finish a task autonomously. Run without --auto to work through it step by step.',
+      ),
+    );
     return false;
   }
 
@@ -115,6 +120,11 @@ export async function runChatOnce(
       ? 'no applicable file change was produced'
       : `run ended with status "${result.status}"`;
     console.log(chalk.yellow(`\n  ⚠ ${reason}.`));
+    console.log(
+      chalk.dim(
+        '  Minerva (a 7B model) often cannot finish a task autonomously. Run without --auto to work through it step by step.',
+      ),
+    );
   }
 
   if (result.changes.length) {
@@ -123,6 +133,19 @@ export async function runChatOnce(
   }
   if (result.verified === false) {
     console.log(chalk.yellow('\n  ⚠ Changes were not successfully verified.'));
+  }
+  // Show the real evidence: the check that ran and what it printed. The
+  // harness proves the code compiled/ran/passed — whether the OUTPUT is what
+  // the student wanted is theirs to confirm.
+  if (succeeded && result.verification?.ok) {
+    const { command, output, source } = result.verification;
+    console.log(chalk.dim(`\n  verified (${source}): $ ${command}`));
+    const lines = output.split('\n').slice(0, 10);
+    for (const line of lines) console.log(`    ${line}`);
+    if (output.split('\n').length > 10) console.log(chalk.dim('    …'));
+    if (source === 'compile and run') {
+      console.log(chalk.dim('  ↑ program output — confirm it matches what you asked for.'));
+    }
   }
   return succeeded;
 }

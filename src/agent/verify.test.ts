@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { detectVerifyCommand, runVerification } from './verify.js';
+import { detectVerifyCommand, requestRequiresExecution, runVerification } from './verify.js';
 
 const dirs: string[] = [];
 
@@ -17,6 +17,11 @@ async function tempProject(): Promise<string> {
 }
 
 describe('detectVerifyCommand', () => {
+  it('does not mistake running tests for executing a changed module', () => {
+    expect(requestRequiresExecution('Fix calc.py and run the tests.')).toBe(false);
+    expect(requestRequiresExecution('Write calc.py, run it, then run the tests.')).toBe(true);
+  });
+
   it('prefers the Test command from .minervacli.md', async () => {
     const dir = await tempProject();
     await writeFile(
@@ -142,6 +147,72 @@ describe('detectVerifyCommand', () => {
       command: "python3 -m py_compile 'calc.py'",
       source: 'syntax check',
     });
+  });
+
+  it('compiles and executes a changed C program when the request requires execution', async () => {
+    const dir = await tempProject();
+    await writeFile(
+      path.join(dir, 'primes.c'),
+      '#include <stdio.h>\nint main(void) { puts("2 3 5 7 11 13 17 19 23 29"); return 0; }\n',
+    );
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['primes.c'],
+      ['primes.c'],
+      undefined,
+      'Compile the program, execute it, and verify the output.',
+    );
+
+    expect(cmd?.source).toBe('compile and run');
+    expect(cmd?.timeoutMs).toBe(10_000);
+    expect(cmd?.command).toContain("cc -std=c11 -Wall -Wextra -pedantic 'primes.c'");
+    const result = await runVerification(cmd!, dir);
+    expect(result).toEqual({ ok: true, output: '2 3 5 7 11 13 17 19 23 29' });
+  });
+
+  it('runs a single requested Python script when the request requires execution', async () => {
+    const dir = await tempProject();
+    await writeFile(path.join(dir, 'hello.py'), 'print("hi")\n');
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['hello.py'],
+      ['hello.py'],
+      async () => false,
+      'Write hello.py and run it.',
+    );
+    expect(cmd?.source).toBe('compile and run');
+    expect(cmd?.command).toBe("python3 'hello.py'");
+    const result = await runVerification(cmd!, dir);
+    expect(result).toEqual({ ok: true, output: 'hi' });
+  });
+
+  it('runs an explicitly named script before an unrelated package test', async () => {
+    const dir = await tempProject();
+    await writeFile(
+      path.join(dir, 'package.json'),
+      JSON.stringify({ scripts: { test: 'node -e "console.log(\'unrelated\')"' } }),
+    );
+    await writeFile(path.join(dir, 'hello.py'), 'print("requested")\n');
+
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['package.json', 'hello.py'],
+      ['hello.py'],
+      async () => false,
+      'Write hello.py, run it, and check its output.',
+    );
+
+    expect(cmd?.command).toBe("python3 'hello.py'");
+    await expect(runVerification(cmd!, dir)).resolves.toEqual({
+      ok: true,
+      output: 'requested',
+    });
+  });
+
+  it('only syntax-checks C when execution was not requested', async () => {
+    const dir = await tempProject();
+    const cmd = await detectVerifyCommand(dir, ['calc.c'], ['calc.c']);
+    expect(cmd).toEqual({ command: "cc -fsyntax-only 'calc.c'", source: 'syntax check' });
   });
 
   it('returns null when nothing applies', async () => {

@@ -64,13 +64,19 @@ async function scaffoldProjectContext(projectDir: string): Promise<void> {
 
 program
   .name('minervacli')
-  .description('Terminal chat client and coding agent for Chat Minerva')
+  .description(
+    'Terminal chat client and assisted coding companion for Chat Minerva (Minerva 7B). ' +
+      'Best used interactively: it proposes changes, you approve them, and the CLI verifies the result.',
+  )
   .version(CLI_VERSION)
   // Without this, the root --project-dir option swallows the identically
   // named option of subcommands like `review`.
   .enablePositionalOptions()
   .argument('[prompt]', 'Send a one-shot message and exit')
-  .option('--auto', 'Full autonomous agent (default: assisted, approve each change)')
+  .option(
+    '--auto',
+    'Experimental autonomous mode. The 7B model often cannot finish a task unaided; a run that ends unverified is rolled back and exits nonzero. Default: assisted — approve each change.',
+  )
   .option('--project-dir <dir>', 'Project root the agent works in', process.cwd())
   .option('--permission-mode <mode>', 'default | acceptEdits | dontAsk', parsePermissionMode)
   .option('--language <language>', 'Reply language: auto | en | it', parseLanguage, 'auto')

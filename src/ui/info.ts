@@ -34,7 +34,7 @@ export const HELP_LINES = [
   '/help    show this help',
   '/info    show session info',
   '/model   switch model',
-  '/auto    toggle auto mode (on|off) — assisted asks before changes',
+  '/auto    toggle experimental auto mode (on|off) — assisted asks before changes',
   '/dir     show or change the project directory the agent works in',
   '/language set reply language (auto|en|it)',
   '/repomap show the ranked repository structure (/repomap <focus>)',

@@ -33,6 +33,17 @@ function firstLine(text: string, max = 100): string {
   return line.length > max ? `${line.slice(0, max)}…` : line;
 }
 
+/** First informative lines of a failed result — an error message whose first
+ * line is just "Command failed (exit 1):" would otherwise hide everything. */
+function errorLines(text: string, maxLines = 6, max = 160): string[] {
+  const lines = text.split('\n').filter((l) => l.trim());
+  const shown = lines
+    .slice(0, maxLines)
+    .map((l) => (l.length > max ? `${l.slice(0, max)}…` : l));
+  if (lines.length > maxLines) shown.push(`… (${lines.length - maxLines} more lines)`);
+  return shown;
+}
+
 function indent(text: string, pad = '  '): string {
   return text
     .split('\n')
@@ -53,8 +64,13 @@ export function consoleAgentEvents(): AgentEvents {
       console.log(chalk.dim(`  [${event.tool.name}] ${event.summary}`));
     },
     onToolEnd(event) {
-      const summary = `    ⎿ ${firstLine(event.result)}`;
-      console.log(event.ok ? chalk.dim(summary) : chalk.red(summary));
+      if (event.ok) {
+        console.log(chalk.dim(`    ⎿ ${firstLine(event.result)}`));
+        return;
+      }
+      const [head, ...rest] = errorLines(event.result);
+      console.log(chalk.red(`    ⎿ ${head ?? '(no output)'}`));
+      for (const line of rest) console.log(chalk.red(`      ${line}`));
     },
     async confirm(event) {
       console.log('');

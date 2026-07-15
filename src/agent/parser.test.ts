@@ -105,6 +105,41 @@ describe('parseToolCalls — JSON fallback layer', () => {
 });
 
 describe('parseToolCalls — code-block Write heuristic (assisted only)', () => {
+  it('applies a trailing fence the model never closed', () => {
+    const response =
+      'Updated `primes.c`:\n\n```c\n#include <stdio.h>\nint main(void) { return 0; }\n';
+    const result = parseToolCalls(response, { codeBlockWriteFallback: true });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'Write',
+        args: {
+          path: 'primes.c',
+          content: '#include <stdio.h>\nint main(void) { return 0; }\n',
+        },
+      }),
+    ]);
+    expect(result.text).not.toContain('#include');
+  });
+
+  it('does not invent content for a fence opened at the very end', () => {
+    const response = 'Updated `primes.c`:\n\n```c';
+    expect(parseToolCalls(response, { codeBlockWriteFallback: true }).toolCalls).toEqual([]);
+  });
+
+  it('accepts a destination filename in the fence info string', () => {
+    const response = '```primes.c\n#include <stdio.h>\nint main(void) { return 0; }\n```';
+    const result = parseToolCalls(response, { codeBlockWriteFallback: true });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'Write',
+        args: {
+          path: 'primes.c',
+          content: '#include <stdio.h>\nint main(void) { return 0; }\n',
+        },
+      }),
+    ]);
+  });
+
   it('proposes a Write when a fence is preceded by a filename and heuristic enabled', () => {
     const response = `Ecco la versione corretta di \`utils.py\`:
 
@@ -229,6 +264,20 @@ x = 1
   it('skips shell fences even when a filename precedes them', () => {
     const response = 'Poi esegui calc.py così:\n\n```bash\npython3 calc.py\n```';
     expect(parseToolCalls(response, { codeBlockWriteFallback: true }).toolCalls).toEqual([]);
+  });
+
+  it('recovers complete C source mislabeled as a shell fence', () => {
+    const response = '```sh\n#include <stdio.h>\nint main(void) { return 0; }\n```';
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      preferredFiles: ['primes.c'],
+    });
+    expect(result.toolCalls[0]).toEqual(
+      expect.objectContaining({
+        tool: 'Write',
+        args: expect.objectContaining({ path: 'primes.c' }),
+      }),
+    );
   });
 
   it('prefers a known project file over other candidates on the same line', () => {
