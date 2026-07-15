@@ -16,9 +16,9 @@ import {
 } from './agent/prompts.js';
 import { collectGitDiff, runReview, type ReviewSeverity } from './agent/review.js';
 import type { AgentSettings } from './tui/App.js';
+import { CLI_VERSION } from './version.js';
 
 const program = new Command();
-const CLI_VERSION = '0.2.0';
 
 function parsePermissionMode(value: string): PermissionMode {
   if (!PERMISSION_MODES.includes(value as PermissionMode)) {

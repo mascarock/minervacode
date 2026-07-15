@@ -1,5 +1,6 @@
 import chalk from 'chalk';
 import type { SessionInfo } from '../types.js';
+import { CLI_VERSION } from '../version.js';
 
 function formatDate(unixSeconds: number): string {
   if (!unixSeconds) return 'unknown';
@@ -49,7 +50,7 @@ export const HELP_LINES = [
 
 export function printSessionInfo(info: SessionInfo): void {
   console.log('');
-  console.log(`${chalk.hex('#d97757')('✻')} ${chalk.bold('Minerva CLI')}`);
+  console.log(`${chalk.hex('#d97757')('✻')} ${chalk.bold(`Minerva CLI v${CLI_VERSION}`)}`);
   console.log('');
   for (const line of sessionInfoLines(info)) {
     console.log(chalk.dim(`  ${line}`));
