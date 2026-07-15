@@ -352,6 +352,19 @@ function parseCodeBlockLayer(
       path = pickFilename(line, knownFiles);
       if (path) break;
     }
+    // Weak models often name the destination only AFTER the code ("Copy
+    // this into main.py") — scan a few lines below the fence too.
+    if (!path) {
+      const after = response
+        .slice(index + raw.length)
+        .split('\n')
+        .filter((l) => l.trim() && !l.trimStart().startsWith('```'))
+        .slice(0, 3);
+      for (const line of after) {
+        path = pickFilename(line, knownFiles);
+        if (path) break;
+      }
+    }
 
     // Weak models also put the filename inside the fence as a leading
     // comment — that marker is more specific than prose above the fence.

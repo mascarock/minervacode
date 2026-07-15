@@ -182,6 +182,18 @@ x = 1
     expect(parseToolCalls(response, { codeBlockWriteFallback: true }).toolCalls).toEqual([]);
   });
 
+  it('finds the destination filename in prose after the fence', () => {
+    const response =
+      'Here is the extended script:\n\n```python\nx = 1\n```\n\nPlease copy this into main.py and run it.';
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['main.py'],
+    });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({ tool: 'Write', args: { path: 'main.py', content: 'x = 1\n' } }),
+    ]);
+  });
+
   it('uses a unique relevance-ranked source for a filename-less matching fence', () => {
     const response = 'Here is the fix:\n\n```javascript\nfunction add(a, b) { return a + b; }\n```';
     const result = parseToolCalls(response, {

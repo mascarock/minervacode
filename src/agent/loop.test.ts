@@ -130,6 +130,10 @@ describe('requestExpectsChanges', () => {
     ).toBe(true);
     expect(requestExpectsChanges('Ask the user for a number and print its square.')).toBe(true);
     expect(requestExpectsChanges('Stampa i primi 10 numeri primi.')).toBe(true);
+    expect(
+      requestExpectsChanges('adesso estendi lo script per i primi 40 numeri primi'),
+    ).toBe(true);
+    expect(requestExpectsChanges('Extend the script to 40 primes.')).toBe(true);
     // Informational phrasing still wins over behavior verbs.
     expect(requestExpectsChanges('Cosa stampa questo script?')).toBe(false);
     expect(requestExpectsChanges('Explain what this prints.')).toBe(false);

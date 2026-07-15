@@ -67,7 +67,7 @@ const FORBIDS_NEW_FILES =
   /\b(?:do\s+not|don't|dont|never|without|non|senza)\s+(?:creat\w*|writ\w*|add\w*|generat\w*|scaffold\w*|mak\w*|crea\w*|scriv\w*|aggiung\w*|genera\w*)\b/i;
 const SOURCE_FILE_PATH = /\.(?:[cm]?[jt]sx?|py|go|rs|java|c|cc|cpp|cxx|h|hpp)$/i;
 const EXPECTS_FILE_CHANGES =
-  /\b(?:fix\w*|correct\w*|creat\w*|writ\w*|add\w*|updat\w*|modif\w*|edit\w*|chang\w*|implement\w*|refactor\w*|remove\w*|rename\w*|corregg\w*|sistem\w*|crea\w*|scriv\w*|aggiung\w*|aggiorn\w*|modific\w*|cambi\w*|implementa\w*|rimuov\w*|rinomina\w*)\b/i;
+  /\b(?:fix\w*|correct\w*|creat\w*|writ\w*|add\w*|updat\w*|modif\w*|edit\w*|chang\w*|implement\w*|refactor\w*|remove\w*|rename\w*|extend\w*|expand\w*|improv\w*|corregg\w*|sistem\w*|crea\w*|scriv\w*|aggiung\w*|aggiorn\w*|modific\w*|cambi\w*|implementa\w*|rimuov\w*|rinomina\w*|estend\w*|espand\w*|amplia\w*|miglior\w*)\b/i;
 /**
  * Exercise-style requests describe the PROGRAM's behavior instead of naming
  * a file change: "Chiedi all'utente tre numeri e sommali", "Ask the user for
