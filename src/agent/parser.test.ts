@@ -146,6 +146,104 @@ x = 1
     const response = 'Esempio:\n\n```python\nx = 1\n```';
     expect(parseToolCalls(response, { codeBlockWriteFallback: true }).toolCalls).toEqual([]);
   });
+
+  it('detects a filename marker comment inside the fence and strips it', () => {
+    const response = '```python\n# Updated `calc.py`\n\ndef add(a, b):\n    return a + b\n```';
+    const result = parseToolCalls(response, { codeBlockWriteFallback: true });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'Write',
+        args: { path: 'calc.py', content: 'def add(a, b):\n    return a + b\n' },
+      }),
+    ]);
+  });
+
+  it('accepts a trailing description after an explicit marker word', () => {
+    const response =
+      '```python\n# Updated `calc.py`: Remove division by zero error\nx = 1\n```';
+    const result = parseToolCalls(response, { codeBlockWriteFallback: true });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({ tool: 'Write', args: { path: 'calc.py', content: 'x = 1\n' } }),
+    ]);
+  });
+
+  it('prefers the inside-fence marker over prose above the fence', () => {
+    const response = 'Guarda test_calc.py per i test:\n\n```python\n// file: app.js\nlet x = 1;\n```';
+    const result = parseToolCalls(response, { codeBlockWriteFallback: true });
+    expect(result.toolCalls[0].args.path).toBe('app.js');
+  });
+
+  it('does not treat a descriptive comment as a filename marker', () => {
+    const response = 'Updated `calc.py`:\n\n```python\n# This module implements calc.py logic\nx = 1\n```';
+    const result = parseToolCalls(response, { codeBlockWriteFallback: true });
+    expect(result.toolCalls[0].args).toEqual({
+      path: 'calc.py',
+      content: '# This module implements calc.py logic\nx = 1\n',
+    });
+  });
+
+  it('rejects implausible extensions like unittest.main', () => {
+    const response = 'Run it via unittest.main as shown:\n\n```python\nimport unittest\n```';
+    expect(parseToolCalls(response, { codeBlockWriteFallback: true }).toolCalls).toEqual([]);
+  });
+
+  it('skips shell fences even when a filename precedes them', () => {
+    const response = 'Poi esegui calc.py così:\n\n```bash\npython3 calc.py\n```';
+    expect(parseToolCalls(response, { codeBlockWriteFallback: true }).toolCalls).toEqual([]);
+  });
+
+  it('prefers a known project file over other candidates on the same line', () => {
+    const response = 'In `helpers.py` c\'è la logica usata da `main.py`:\n\n```python\nx = 1\n```';
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['helpers.py', 'README.md'],
+    });
+    expect(result.toolCalls[0].args.path).toBe('helpers.py');
+  });
+
+  it('maps a bare filename to its unique nested project path', () => {
+    const response = 'Updated `config.ts`:\n\n```ts\nexport const x = 1;\n```';
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['src/config.ts', 'src/index.ts'],
+    });
+    expect(result.toolCalls[0].args.path).toBe('src/config.ts');
+  });
+
+  it('rejects a bare filename that matches several project files', () => {
+    const response = 'Updated `config.ts`:\n\n```ts\nexport const x = 1;\n```';
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['src/config.ts', 'test/config.ts'],
+    });
+    expect(result.toolCalls).toEqual([]);
+  });
+
+  it('still accepts an explicit nested path when the basename is ambiguous', () => {
+    const response = 'Updated `src/config.ts`:\n\n```ts\nexport const x = 1;\n```';
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['src/config.ts', 'test/config.ts'],
+    });
+    expect(result.toolCalls[0].args.path).toBe('src/config.ts');
+  });
+
+  it('falls through to the code-block layer when XML names only unknown tools', () => {
+    const response = `<minerva_tool name="RunTests">
+<command>pytest</command>
+</minerva_tool>
+
+Updated \`calc.py\`:
+\`\`\`python
+x = 1
+\`\`\``;
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownTools: ['Read', 'Write', 'Bash'],
+    });
+    expect(result.toolCalls.map((c) => c.tool)).toContain('Write');
+    expect(result.text).not.toContain('minerva_tool');
+  });
 });
 
 describe('parseToolCalls — plain text', () => {

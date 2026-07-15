@@ -13,6 +13,9 @@ export const globTool: Tool<z.infer<typeof schema>> = {
   summarize: (input) => input.pattern,
   isReadOnly: () => true,
   async call(input, ctx) {
+    if (input.pattern.startsWith('/') || input.pattern.split(/[\\/]/).includes('..')) {
+      throw new Error('Glob patterns must stay inside the project directory.');
+    }
     const results: string[] = [];
     for await (const entry of glob(input.pattern, {
       cwd: ctx.projectDir,

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="428" viewBox="0 0 760 428">
+  <style>
+    text { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+    .chrome { fill: #2a2a35; }
+    .bg { fill: #16161e; }
+    .dim { fill: #6b6b7b; }
+    .fg { fill: #d4d4dc; }
+    .accent { fill: #d97757; }
+    .ok { fill: #7bc275; }
+    .cmd { fill: #e8e8f0; }
+  </style>
+  <rect class="bg" x="0" y="0" width="760" height="428" rx="10"/>
+  <rect class="chrome" x="0" y="0" width="760" height="34" rx="10"/>
+  <rect class="chrome" x="0" y="17" width="760" height="17"/>
+  <circle cx="22" cy="17" r="6" fill="#ff5f57"/>
+  <circle cx="42" cy="17" r="6" fill="#febc2e"/>
+  <circle cx="62" cy="17" r="6" fill="#28c840"/>
+  <text x="24" y="66" class="cmd">$ minervacli --auto --project-dir ~/compiti \</text>
+  <text x="24" y="86" class="cmd">    "the average function in calc.py has a bug — fix it and verify"</text>
+
+  <text x="24" y="126" class="dim">[Write] calc.py</text>
+  <text x="40" y="146" class="dim">⎿ Wrote calc.py (20 lines)</text>
+  <text x="24" y="166" class="dim">◦ Verifying changes (unittest files):</text>
+  <text x="40" y="186" class="dim">python3 -m py_compile 'calc.py' &amp;&amp; python3 -m unittest discover -q</text>
+  <text x="24" y="206" class="dim">[Bash] python3 -m py_compile 'calc.py' &amp;&amp; python3 -m unittest discover -q</text>
+  <text x="40" y="226" class="ok">⎿ Ran 3 tests · OK</text>
+
+  <text x="24" y="266" class="accent">●</text>
+  <text x="44" y="266" class="fg">The calc.py module now includes a check for division by zero before</text>
+  <text x="44" y="286" class="fg">calculating the average. This change was verified using Python's</text>
+  <text x="44" y="306" class="fg">unittest framework, which runs three unit tests successfully.</text>
+
+  <text x="24" y="346" class="dim">◦ Reviewing applied changes…</text>
+  <text x="24" y="376" class="accent">●</text>
+  <text x="44" y="376" class="fg">Code review: LGTM</text>
+
+  <text x="24" y="406" class="dim">changed: calc.py</text>
+</svg>

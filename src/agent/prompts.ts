@@ -16,6 +16,16 @@ export interface ProjectFile {
   content: string;
 }
 
+export type AgentLanguage = 'auto' | 'en' | 'it';
+
+export const AGENT_LANGUAGES: AgentLanguage[] = ['auto', 'en', 'it'];
+
+export function languageInstruction(language: AgentLanguage = 'auto'): string {
+  if (language === 'it') return 'Reply in Italian.';
+  if (language === 'en') return 'Reply in English.';
+  return "Reply in the same language as the student's latest request.";
+}
+
 /**
  * Loads small text files for direct context injection. ChatMinerva (7B)
  * does not reliably emit Read tool calls, so for homework-sized projects
@@ -96,49 +106,68 @@ export async function loadProjectContext(projectDir: string): Promise<string | n
 export function buildSystemPrompt(options: {
   projectDir: string;
   tools: Tool[];
+  language?: AgentLanguage;
+  autonomous?: boolean;
   projectContext?: string | null;
   projectFiles?: string[];
   fileContents?: ProjectFile[];
   /** Files that exist but were too big to inject. */
   skippedFiles?: string[];
 }): string {
-  const { projectDir, tools, projectContext, projectFiles, fileContents, skippedFiles } = options;
+  const {
+    projectDir,
+    tools,
+    language = 'auto',
+    autonomous = false,
+    projectContext,
+    projectFiles,
+    fileContents,
+    skippedFiles,
+  } = options;
+
+  const languageRule = languageInstruction(language);
 
   const sections = [
-    `Sei Minerva, un tutor di programmazione che aiuta uno studente direttamente nel terminale.
-Lavori sui file REALI del progetto dello studente.
+    `You are Minerva, a programming agent helping a student directly in the terminal.
+You work on the student's REAL project files.
 
-Directory di progetto: ${projectDir}`,
+Project directory: ${projectDir}`,
   ];
 
   if (projectContext) {
-    sections.push(`Contesto del progetto (da ${PROJECT_CONTEXT_FILE}):\n${projectContext}`);
+    sections.push(`Project context (from ${PROJECT_CONTEXT_FILE}):\n${projectContext}`);
   }
 
   if (fileContents?.length) {
     const blocks = fileContents.map((f) => `=== ${f.path} ===\n${f.content}`).join('\n\n');
-    sections.push(`Contenuto attuale dei file del progetto:\n\n${blocks}`);
+    sections.push(`Current project file contents:\n\n${blocks}`);
   } else if (projectFiles?.length) {
     sections.push(
-      `File nella directory di progetto (usa i tool per leggerli, non inventarne il contenuto):\n${projectFiles.join('\n')}`,
+      `Files in the project directory (use tools to read them; never invent their contents):\n${projectFiles.join('\n')}`,
     );
   }
 
   if (skippedFiles?.length) {
     sections.push(
-      `Altri file non mostrati per dimensione (leggili con il tool Read se servono):\n${skippedFiles.join('\n')}`,
+      `Other files omitted because of their size (read them with Read when needed):\n${skippedFiles.join('\n')}`,
     );
   }
 
   const toolList = tools.map((t) => `- ${t.name}: ${t.description}`).join('\n');
 
-  sections.push(`Regole:
-- Se proponi una modifica a un file, scrivi il NUOVO CONTENUTO COMPLETO del file in un blocco di codice preceduto dal nome del file (esempio: "Ecco \`utils.py\` corretto:"), così la CLI può applicarla dopo conferma dello studente.
-- Spiega sempre brevemente cosa cambi e perché: lo studente deve capire.
-- Non inventare MAI file o contenuti che non vedi qui.
-- Rispondi in italiano.
+  sections.push(`Rules:
+- ${languageRule}
+- Act on coding requests instead of only describing suggested steps. Inspect the relevant files, make the requested changes, and verify the result.
+- Use the tools below to read files, edit files, and run shell commands. Do not ask the student to run a command that you can run yourself.
+- After changing code, run the relevant tests, build, typecheck, or lint command. If verification fails, diagnose the output, fix the issue, and run it again.
+- Never invent files or file contents that you have not seen.
+- Never rewrite or weaken tests to make them pass — fix the source code instead. Only modify test files when the student explicitly asks for it.
+- Briefly explain what you changed and why so the student can learn. Highlight the important concepts in **bold**.
+${autonomous ? '- Autonomous mode is enabled: proceed with necessary file changes and commands without asking for confirmation.' : '- Approval mode is enabled: the CLI will request confirmation before potentially modifying operations.'}
+- If you cannot emit a structured Write or Edit call, write the COMPLETE new file contents in a fenced code block with the filename on its own line immediately BEFORE the fence (example: "Updated \`utils.py\`:"). One file per code block; never put the filename only inside the block. The CLI applies this fallback.
+- Run shell commands only through the Bash tool block — a plain \`\`\`bash code block is NOT executed.
 
-Formato avanzato (se ti serve leggere altri file o eseguire comandi):
+Tool-call format:
 ${toolList}
 
 <minerva_tool name="Read">
@@ -149,7 +178,7 @@ ${toolList}
 <command>python -m pytest</command>
 </minerva_tool>
 
-I risultati arrivano nel messaggio successivo come <tool_result>. Massimo 3 blocchi per risposta.`);
+Tool results arrive in the next message as <tool_result>. Emit at most 3 tool blocks per response.`);
 
   return sections.join('\n\n');
 }
@@ -159,17 +188,17 @@ export function formatToolResult(name: string, result: string, ok: boolean): str
   return `<tool_result name="${name}" status="${status}">\n${result}\n</tool_result>`;
 }
 
-export const PROJECT_CONTEXT_TEMPLATE = `# Contesto del progetto
+export const PROJECT_CONTEXT_TEMPLATE = `# Project context
 
-Descrivi qui il tuo progetto per Minerva: cosa fa, come si esegue, cosa
-stai studiando. Minerva legge questo file all'inizio di ogni sessione.
+Describe your project for Minerva: what it does, how to run it, and what
+you are studying. Minerva reads this file at the start of every session.
 
-## Comandi
+## Commands
 
-- Esegui: \`python main.py\`
+- Run: \`python main.py\`
 - Test: \`python -m pytest\`
 
 ## Note
 
-- (aggiungi qui vincoli o richieste del docente)
+- (add any constraints or requirements here)
 `;

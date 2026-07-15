@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="308" viewBox="0 0 760 308">
+  <style>
+    text { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }
+    .chrome { fill: #2a2a35; }
+    .bg { fill: #16161e; }
+    .dim { fill: #6b6b7b; }
+    .fg { fill: #d4d4dc; }
+    .add { fill: #7bc275; }
+    .del { fill: #e06c75; }
+    .hunk { fill: #61afef; }
+    .bold { fill: #e8e8f0; font-weight: bold; }
+  </style>
+  <rect class="bg" x="0" y="0" width="760" height="308" rx="10"/>
+  <rect class="chrome" x="0" y="0" width="760" height="34" rx="10"/>
+  <rect class="chrome" x="0" y="17" width="760" height="17"/>
+  <circle cx="22" cy="17" r="6" fill="#ff5f57"/>
+  <circle cx="42" cy="17" r="6" fill="#febc2e"/>
+  <circle cx="62" cy="17" r="6" fill="#28c840"/>
+
+  <text x="24" y="66" class="bold">Write: calc.py</text>
+  <text x="24" y="96" class="dim">--- calc.py</text>
+  <text x="24" y="116" class="dim">+++ calc.py</text>
+  <text x="24" y="136" class="hunk">@@ -1,6 +1,4 @@</text>
+  <text x="24" y="156" class="dim"> def average(numbers):</text>
+  <text x="24" y="176" class="dim">     """Return the arithmetic mean of a list of numbers."""</text>
+  <text x="24" y="196" class="del">-    total = 0</text>
+  <text x="24" y="216" class="del">-    for n in numbers:</text>
+  <text x="24" y="236" class="del">-        total += n</text>
+  <text x="24" y="256" class="del">-    return total / (len(numbers) - 1)</text>
+  <text x="24" y="276" class="add">+    return sum(numbers) / len(numbers)</text>
+
+  <text x="24" y="300" class="fg">? Run Write? (Y/n)</text>
+</svg>

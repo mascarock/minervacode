@@ -30,7 +30,7 @@ export function ApprovalPrompt({ request }: { request: ApprovalRequest }) {
       <Box marginY={1} marginLeft={1}>
         <DiffText patch={request.preview} />
       </Box>
-      <Text dimColor>y approva · n rifiuta</Text>
+      <Text dimColor>y approve · n deny</Text>
     </Box>
   );
 }

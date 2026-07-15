@@ -4,6 +4,8 @@ import { MinervaClient } from './api/client.js';
 import type { MinervaConfig } from './types.js';
 import { validateSession } from './api/auth.js';
 import { runAgent } from './agent/loop.js';
+import { ChangeLog } from './agent/context.js';
+import { revertNetChanges } from './agent/rollback.js';
 import { consoleAgentEvents } from './ui/agent-console.js';
 import { browserLogin, loginWithToken } from './auth/browser-login.js';
 import {
@@ -72,19 +74,50 @@ export async function runInfo(client: MinervaClient, config: MinervaConfig): Pro
   printSessionInfo(info);
 }
 
+/** Returns false when the run ended without a verified, complete result. */
 export async function runChatOnce(
   client: MinervaClient,
   prompt: string,
   agent: AgentSettings,
-): Promise<void> {
-  await runAgent(client, {
+): Promise<boolean> {
+  const changeLog = new ChangeLog();
+  const permissionMode = agent.permissionMode ?? (agent.auto ? 'dontAsk' : 'default');
+  const result = await runAgent(client, {
     history: [],
     prompt,
     projectDir: agent.projectDir,
-    permissionMode: agent.permissionMode ?? (agent.auto ? 'acceptEdits' : 'default'),
-    assisted: !agent.auto,
+    permissionMode,
+    language: agent.language,
     events: consoleAgentEvents(),
+    changeLog,
   });
+
+  // A completed run whose changes had no applicable verifier counts as
+  // success (verified === null); anything else incomplete is a failure.
+  const succeeded = result.status === 'completed' && result.verified !== false;
+
+  // Unattended run that ended incomplete or with failing checks: leaving a
+  // silently broken project behind is worse than doing nothing — restore it.
+  if (!succeeded && permissionMode === 'dontAsk' && result.netChanges.length) {
+    const reverted = await revertNetChanges(agent.projectDir, result.netChanges);
+    const reason =
+      result.verified === false ? 'verification failed' : `run ended with status "${result.status}"`;
+    console.log(
+      chalk.yellow(
+        `\n  ⚠ ${reason} — reverted: ${reverted.join(', ') || '(nothing revertable)'}`,
+      ),
+    );
+    return false;
+  }
+
+  if (result.changes.length) {
+    const files = [...new Set(result.changes.map((c) => c.path))];
+    console.log(chalk.dim(`\n  changed: ${files.join(', ')}`));
+  }
+  if (result.verified === false) {
+    console.log(chalk.yellow('\n  ⚠ Changes were not successfully verified.'));
+  }
+  return succeeded;
 }
 
 export async function runRepl(agent: AgentSettings, initialConfig?: MinervaConfig): Promise<void> {
@@ -119,7 +152,7 @@ export async function runRepl(agent: AgentSettings, initialConfig?: MinervaConfi
       return;
     }
 
-    console.log(chalk.dim('Arrivederci!\n'));
+    console.log(chalk.dim('Goodbye!\n'));
     return;
   }
 }

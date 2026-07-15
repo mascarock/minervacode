@@ -46,6 +46,9 @@ export function consoleAgentEvents(): AgentEvents {
     onText(text) {
       console.log(`\n● ${text.replaceAll('\n', '\n  ')}\n`);
     },
+    onStatus(text) {
+      console.log(chalk.dim(`  ◦ ${text}`));
+    },
     onToolStart(event) {
       console.log(chalk.dim(`  [${event.tool.name}] ${event.summary}`));
     },

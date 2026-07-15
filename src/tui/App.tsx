@@ -1,3 +1,5 @@
+import { stat } from 'node:fs/promises';
+import path from 'node:path';
 import { useRef, useState } from 'react';
 import { Box, Text, useApp, useInput } from 'ink';
 import type { MinervaClient } from '../api/client.js';
@@ -8,7 +10,9 @@ import type { ChatMessage, MinervaConfig, ModelInfo, SessionInfo } from '../type
 import { HELP_LINES, sessionInfoLines } from '../ui/info.js';
 import { runAgent } from '../agent/loop.js';
 import { ChangeLog } from '../agent/context.js';
+import { collectGitDiff, runReview } from '../agent/review.js';
 import type { PermissionMode } from '../agent/permissions.js';
+import type { AgentLanguage } from '../agent/prompts.js';
 import { getTools } from '../tools/registry.js';
 import { Transcript, type Entry } from './Transcript.js';
 import { InputBox } from './InputBox.js';
@@ -33,6 +37,7 @@ export interface AgentSettings {
   auto: boolean;
   /** Explicit --permission-mode; when unset it follows the auto toggle. */
   permissionMode?: PermissionMode;
+  language: AgentLanguage;
 }
 
 interface AppProps {
@@ -46,13 +51,15 @@ interface AppProps {
 export function App({ client, config: initialConfig, sessionInfo, agent, onAction }: AppProps) {
   const { exit } = useApp();
   const [auto, setAuto] = useState(agent.auto);
+  const [language, setLanguage] = useState<AgentLanguage>(agent.language);
+  const [projectDir, setProjectDir] = useState(agent.projectDir);
   const [entries, setEntries] = useState<Entry[]>([
     {
       id: 0,
       kind: 'welcome',
       info: sessionInfo,
       extra: [
-        `agent: ${agent.auto ? 'auto' : 'assisted'} · dir: ${agent.projectDir}`,
+        `agent: ${agent.auto ? 'auto' : 'assisted'} · language: ${agent.language} · dir: ${agent.projectDir}`,
       ],
     },
   ]);
@@ -72,7 +79,7 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
   };
 
   const permissionMode = (): PermissionMode =>
-    agent.permissionMode ?? (auto ? 'acceptEdits' : 'default');
+    agent.permissionMode ?? (auto ? 'dontAsk' : 'default');
 
   useInput((_input, key) => {
     if (key.escape && (phase === 'waiting' || phase === 'tooling')) {
@@ -96,9 +103,9 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
       const result = await runAgent(client, {
         history: messagesRef.current,
         prompt: text,
-        projectDir: agent.projectDir,
+        projectDir,
         permissionMode: permissionMode(),
-        assisted: !auto,
+        language,
         signal: controller.signal,
         changeLog: changeLogRef.current,
         events: {
@@ -106,6 +113,9 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
             push({ kind: 'assistant', text: t });
             setPhase('waiting');
             setWaitStart(Date.now());
+          },
+          onStatus: (t) => {
+            push({ kind: 'system', text: t });
           },
           onToolStart: (e) => {
             setLiveTool(`[${e.tool.name}] ${e.summary}`);
@@ -135,6 +145,12 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
         },
       });
       messagesRef.current = result.history;
+      if (result.verified === false && result.netChanges.length) {
+        push({
+          kind: 'system',
+          text: 'Changes were kept so you can inspect them with /diff. Ask Minerva to fix the failure or revert manually.',
+        });
+      }
     } catch (err) {
       push({ kind: 'error', text: err instanceof Error ? err.message : String(err) });
     } finally {
@@ -146,8 +162,12 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
   };
 
   const handleCommand = async (line: string) => {
-    const [cmd, ...rest] = line.toLowerCase().split(/\s+/);
-    const arg = rest.join(' ');
+    const [rawCmd, ...rest] = line.split(/\s+/);
+    const cmd = rawCmd.toLowerCase();
+    // Paths and language names are case-sensitive/insensitive respectively;
+    // keep the raw argument and lowercase per command as needed.
+    const rawArg = rest.join(' ');
+    const arg = rawArg.toLowerCase();
 
     if (cmd === '/exit' || cmd === '/quit') return finish('exit');
     if (cmd === '/logout') return finish('logout');
@@ -170,9 +190,26 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
       return push({
         kind: 'system',
         text: next
-          ? 'Auto mode on — edits apply without asking, bash still asks.'
+          ? 'Auto mode on — edits and shell commands run without asking.'
           : 'Assisted mode — every change needs your approval.',
       });
+    }
+
+    if (cmd === '/language' || cmd === '/lang') {
+      const aliases: Record<string, AgentLanguage> = {
+        auto: 'auto',
+        en: 'en',
+        english: 'en',
+        it: 'it',
+        italian: 'it',
+        italiano: 'it',
+      };
+      const next = aliases[arg];
+      if (!next) {
+        return push({ kind: 'system', text: 'Usage: /language auto|en|it' });
+      }
+      setLanguage(next);
+      return push({ kind: 'system', text: `Reply language set to ${next}.` });
     }
 
     if (cmd === '/tools') {
@@ -194,6 +231,63 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
       return;
     }
 
+    if (cmd === '/dir') {
+      if (!rawArg) {
+        return push({ kind: 'system', text: `Project directory: ${projectDir}` });
+      }
+      const next = path.resolve(rawArg.replace(/^~(?=$|\/)/, process.env.HOME ?? '~'));
+      try {
+        const info = await stat(next);
+        if (!info.isDirectory()) throw new Error('not a directory');
+      } catch {
+        return push({ kind: 'system', text: `Not a directory: ${next}` });
+      }
+      // The conversation carries the OLD project's injected file contents
+      // and the changelog its diffs — both must not leak into the new one.
+      setProjectDir(next);
+      messagesRef.current = [];
+      changeLogRef.current = new ChangeLog();
+      return push({
+        kind: 'system',
+        text: `Project directory set to ${next}\nConversation and session diff were reset for the new project.`,
+      });
+    }
+
+    if (cmd === '/review') {
+      const changes = changeLogRef.current.all();
+      const diff = changes.length
+        ? changes.map((c) => c.patch).join('\n\n')
+        : await collectGitDiff(projectDir);
+      if (!diff) {
+        return push({
+          kind: 'system',
+          text: 'Nothing to review — no session changes and no pending git diff.',
+        });
+      }
+      push({
+        kind: 'system',
+        text: changes.length
+          ? `Reviewing ${changes.length} change(s) from this session…`
+          : 'Reviewing pending git diff…',
+      });
+      setPhase('waiting');
+      setWaitStart(Date.now());
+      const controller = new AbortController();
+      abortRef.current = controller;
+      try {
+        const review = await runReview(client, {
+          diff,
+          language,
+          signal: controller.signal,
+        });
+        push({ kind: 'assistant', text: `Code review:\n${review.raw}` });
+      } finally {
+        abortRef.current = null;
+        setPhase('idle');
+      }
+      return;
+    }
+
     if (cmd === '/model') {
       const list = await listModels(client);
       if (!list.length) return push({ kind: 'system', text: 'No models available.' });
@@ -208,7 +302,10 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
   const onSubmit = (raw: string) => {
     const line = raw.trim();
     if (!line || phase !== 'idle') return;
-    if (line.startsWith('/')) {
+    // Only a bare word after the slash is a command — "/Users/nick/…" or
+    // "/tmp/file.py" in a message is a path, not a command.
+    const firstToken = line.split(/\s+/, 1)[0];
+    if (/^\/[a-z]+$/i.test(firstToken)) {
       void handleCommand(line).catch((err: unknown) => {
         push({ kind: 'error', text: err instanceof Error ? err.message : String(err) });
       });

@@ -14,7 +14,7 @@ export const bashTool: Tool<z.infer<typeof schema>> = {
   summarize: (input) => input.command,
   isReadOnly: () => false,
   call(input, ctx) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       exec(
         input.command,
         {
@@ -30,7 +30,7 @@ export const bashTool: Tool<z.infer<typeof schema>> = {
           }
           if (error) {
             const code = error.code ?? 'unknown';
-            resolve(`Command failed (exit ${code})${output ? `:\n${output}` : ''}`);
+            reject(new Error(`Command failed (exit ${code})${output ? `:\n${output}` : ''}`));
           } else {
             resolve(output || '(no output)');
           }

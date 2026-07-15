@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
-import { resolveInProject, type Tool } from './tool.js';
+import { assertRealPathInProject, resolveInProject, type Tool } from './tool.js';
 
 const schema = z.object({ path: z.string() });
 
@@ -14,6 +14,7 @@ export const readTool: Tool<z.infer<typeof schema>> = {
   isReadOnly: () => true,
   async call(input, ctx) {
     const file = resolveInProject(ctx.projectDir, input.path);
+    await assertRealPathInProject(ctx.projectDir, file);
     const text = await readFile(file, 'utf-8');
     if (!text) return '(empty file)';
     if (text.length > MAX_CHARS) {

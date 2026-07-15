@@ -8,7 +8,13 @@ import { MinervaClient } from './api/client.js';
 import { clearConfig } from './auth/store.js';
 import { runRepl, runInfo, runChatOnce, runLoginFlow, ensureConfig } from './repl.js';
 import { PERMISSION_MODES, type PermissionMode } from './agent/permissions.js';
-import { PROJECT_CONTEXT_FILE, PROJECT_CONTEXT_TEMPLATE } from './agent/prompts.js';
+import {
+  AGENT_LANGUAGES,
+  PROJECT_CONTEXT_FILE,
+  PROJECT_CONTEXT_TEMPLATE,
+  type AgentLanguage,
+} from './agent/prompts.js';
+import { collectGitDiff, runReview, type ReviewSeverity } from './agent/review.js';
 import type { AgentSettings } from './tui/App.js';
 
 const program = new Command();
@@ -20,10 +26,18 @@ function parsePermissionMode(value: string): PermissionMode {
   return value as PermissionMode;
 }
 
+function parseLanguage(value: string): AgentLanguage {
+  if (!AGENT_LANGUAGES.includes(value as AgentLanguage)) {
+    throw new InvalidArgumentError(`Must be one of: ${AGENT_LANGUAGES.join(', ')}`);
+  }
+  return value as AgentLanguage;
+}
+
 interface MainOptions {
   auto?: boolean;
   projectDir: string;
   permissionMode?: PermissionMode;
+  language: AgentLanguage;
   init?: boolean;
   headless?: boolean;
 }
@@ -33,6 +47,7 @@ function agentSettings(opts: MainOptions): AgentSettings {
     projectDir: path.resolve(opts.projectDir),
     auto: opts.auto ?? false,
     permissionMode: opts.permissionMode,
+    language: opts.language,
   };
 }
 
@@ -50,10 +65,14 @@ program
   .name('minervacli')
   .description('Terminal chat client and coding agent for Chat Minerva')
   .version('0.1.0')
+  // Without this, the root --project-dir option swallows the identically
+  // named option of subcommands like `review`.
+  .enablePositionalOptions()
   .argument('[prompt]', 'Send a one-shot message and exit')
   .option('--auto', 'Full autonomous agent (default: assisted, approve each change)')
   .option('--project-dir <dir>', 'Project root the agent works in', process.cwd())
   .option('--permission-mode <mode>', 'default | acceptEdits | dontAsk', parsePermissionMode)
+  .option('--language <language>', 'Reply language: auto | en | it', parseLanguage, 'auto')
   .option('--init', `Scaffold a ${PROJECT_CONTEXT_FILE} project context file and exit`)
   .option('--headless', 'Run browser login headless')
   .action(async (prompt: string | undefined, opts: MainOptions) => {
@@ -66,7 +85,8 @@ program
       if (prompt) {
         const config = await ensureConfig();
         const client = new MinervaClient(config);
-        await runChatOnce(client, prompt, agent);
+        const ok = await runChatOnce(client, prompt, agent);
+        if (!ok) process.exitCode = 1;
         return;
       }
       await runRepl(agent);
@@ -90,6 +110,47 @@ program
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`Login failed: ${msg}`));
+      process.exit(1);
+    }
+  });
+
+const SEVERITY_COLOR: Record<ReviewSeverity, (s: string) => string> = {
+  bug: chalk.red,
+  warn: chalk.yellow,
+  nit: chalk.dim,
+};
+
+program
+  .command('review')
+  .description('Ask Minerva to review pending git changes in the project')
+  .option('--project-dir <dir>', 'Project root to review', process.cwd())
+  .option('--language <language>', 'Reply language: auto | en | it', parseLanguage, 'auto')
+  .action(async (opts: { projectDir: string; language: AgentLanguage }) => {
+    try {
+      const projectDir = path.resolve(opts.projectDir);
+      const diff = await collectGitDiff(projectDir);
+      if (!diff) {
+        console.log(chalk.dim('Nothing to review — no pending git changes.'));
+        return;
+      }
+      const config = await ensureConfig();
+      const client = new MinervaClient(config);
+      console.log(chalk.dim('Reviewing pending git diff…'));
+      const review = await runReview(client, { diff, language: opts.language });
+      if (review.findings.length) {
+        console.log('');
+        for (const finding of review.findings) {
+          const tag = `[${finding.severity.toUpperCase()}]`;
+          console.log(`  ${SEVERITY_COLOR[finding.severity](tag)} ${finding.text}`);
+        }
+        console.log('');
+      } else {
+        console.log(`\n● ${review.raw.replaceAll('\n', '\n  ')}\n`);
+      }
+      process.exitCode = review.hasBugs ? 1 : 0;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(chalk.red(`Review failed: ${msg}`));
       process.exit(1);
     }
   });

@@ -1,7 +1,7 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
-import { resolveInProject, type Tool } from './tool.js';
+import { assertRealPathInProject, resolveInProject, type Tool } from './tool.js';
 
 const schema = z.object({
   pattern: z.string(),
@@ -35,6 +35,9 @@ export const grepTool: Tool<z.infer<typeof schema>> = {
   async call(input, ctx) {
     const regex = new RegExp(input.pattern);
     const root = resolveInProject(ctx.projectDir, input.path ?? '.');
+    // The recursive walk already skips symlink entries, but a direct path
+    // argument would follow one — reject links that escape the project.
+    await assertRealPathInProject(ctx.projectDir, root);
     const rootStat = await stat(root);
 
     const matches: string[] = [];
