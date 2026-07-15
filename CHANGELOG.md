@@ -12,6 +12,10 @@ proposed a Write.
 - Look for the destination filename in the prose BELOW a fence too
   ("Please copy this into main.py") — the model frequently names the file
   only after the code, which was previously invisible to the parser.
+- Merge adopts a rewritten module-level program that omits — but still
+  calls — the file's existing definitions ("extend the loop" proposals):
+  the defs are kept, the new program body replaces the old one. Previously
+  this shape was refused as an unauthorized definition removal.
 
 ## 0.4.0 — 2026-07-15
 

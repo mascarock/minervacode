@@ -128,16 +128,12 @@ while count < 40:
     expect(merged).not.toContain('count < 10');
   });
 
-  it('adopts the new program body when it anchors on a shared def', () => {
+  it('lets a complete proposal (all defs + module code) pass through as an overwrite', () => {
     const existing =
       'def is_prime(n):\n    return n > 1\n\nfor n in range(10):\n    print(n)\n';
     const proposed =
       'import math\n\ndef is_prime(n):\n    return all(n % i for i in range(2, int(math.sqrt(n)) + 1)) and n > 1\n\nfor n in range(40):\n    if is_prime(n):\n        print(n)\n';
-    const merged = mergePartialWrite('main.py', existing, proposed);
-    expect(merged).toContain('import math');
-    expect(merged).toContain('math.sqrt');
-    expect(merged).toContain('range(40)');
-    expect(merged).not.toContain('for n in range(10)');
+    expect(mergePartialWrite('main.py', existing, proposed)).toBeNull();
   });
 
   it('still returns null when a non-overlapping proposal has loose statements', () => {

@@ -179,7 +179,7 @@ function mergeBlocks(
   const newLines = proposed.split('\n');
   const oldBlocks = findBlocks(oldLines);
   const newBlocks = findBlocks(newLines);
-  if (!oldBlocks.length || !newBlocks.length) return null;
+  if (!oldBlocks.length) return null;
 
   const oldNames = new Set(oldBlocks.map((b) => b.name));
   const newNames = new Set(newBlocks.map((b) => b.name));
@@ -212,8 +212,8 @@ function mergeBlocks(
         proposed,
       ),
     );
-  const adoptModuleCode =
-    oldModuleCode && newLooseLines.length > 0 && (shared.length > 0 || missingReferenced);
+  const adoptModuleCode = oldModuleCode && newLooseLines.length > 0 && missingReferenced;
+  if (!newBlocks.length && !adoptModuleCode) return null;
 
   // Nothing overlaps: with loose statements in the proposal there is no
   // anchor to merge on (a rewrite or another file's content). But a
