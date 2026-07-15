@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.1 — 2026-07-15
+
+Fixes the "I have to ask too many times" loop observed live: follow-up
+turns like "adesso estendi lo script…" showed the right code but never
+proposed a Write.
+
+- Recognize extend/expand/improve (and estendi/espandi/amplia/migliora)
+  as change requests, so the fence→file machinery stays enabled on
+  follow-up turns phrased that way.
+- Look for the destination filename in the prose BELOW a fence too
+  ("Please copy this into main.py") — the model frequently names the file
+  only after the code, which was previously invisible to the parser.
+
 ## 0.4.0 — 2026-07-15
 
 Reliability release driven by a 16-scenario live battery against the real

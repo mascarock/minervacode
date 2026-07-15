@@ -97,6 +97,49 @@ def maximum(numbers):
     expect(merged).toContain('def is_even');
   });
 
+  it('adopts a new module-level program that still calls the omitted defs', () => {
+    const existing = `def is_prime(n):
+    if n < 2:
+        return False
+    for i in range(2, int(n**0.5) + 1):
+        if n % i == 0:
+            return False
+    return True
+
+count = 0
+num = 2
+while count < 10:
+    if is_prime(num):
+        print(num)
+        count += 1
+    num += 1
+`;
+    const proposed = `count = 0
+num = 2
+while count < 40:
+    if is_prime(num):
+        print(num)
+        count += 1
+    num += 1
+`;
+    const merged = mergePartialWrite('main.py', existing, proposed);
+    expect(merged).toContain('def is_prime');
+    expect(merged).toContain('count < 40');
+    expect(merged).not.toContain('count < 10');
+  });
+
+  it('adopts the new program body when it anchors on a shared def', () => {
+    const existing =
+      'def is_prime(n):\n    return n > 1\n\nfor n in range(10):\n    print(n)\n';
+    const proposed =
+      'import math\n\ndef is_prime(n):\n    return all(n % i for i in range(2, int(math.sqrt(n)) + 1)) and n > 1\n\nfor n in range(40):\n    if is_prime(n):\n        print(n)\n';
+    const merged = mergePartialWrite('main.py', existing, proposed);
+    expect(merged).toContain('import math');
+    expect(merged).toContain('math.sqrt');
+    expect(merged).toContain('range(40)');
+    expect(merged).not.toContain('for n in range(10)');
+  });
+
   it('still returns null when a non-overlapping proposal has loose statements', () => {
     const proposed = `def minimum(numbers):
     return min(numbers)

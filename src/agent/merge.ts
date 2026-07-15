@@ -184,17 +184,9 @@ function mergeBlocks(
   const oldNames = new Set(oldBlocks.map((b) => b.name));
   const newNames = new Set(newBlocks.map((b) => b.name));
   const shared = [...newNames].filter((n) => oldNames.has(n));
-  // Nothing overlaps: with loose statements in the proposal there is no
-  // anchor to merge on (a rewrite or another file's content). But a
-  // proposal of ONLY new definitions and imports is an addition — "add a
-  // function is_even" answered with just that function must append, not
-  // overwrite-and-lose the rest of the file.
-  if (!shared.length) {
-    const looseNewCode = moduleLevelLines(newLines, newBlocks).some(
-      (line) => !importLine.test(line.trim()),
-    );
-    if (looseNewCode) return null;
-  }
+  const newLooseLines = moduleLevelLines(newLines, newBlocks).filter(
+    (line) => !importLine.test(line.trim()),
+  );
 
   // A protected name is never "covered" — restating it does not authorize
   // the full-file-rewrite escape below, the old body must survive.
@@ -207,6 +199,28 @@ function mergeBlocks(
   // module-level code the file had. A proposal that has all defs but drops
   // the module-level code is still partial.
   if (coversAllDefs && (newModuleCode || !oldModuleCode)) return null;
+
+  // "Extend the loop" proposals rewrite the module-level program while
+  // omitting the defs it calls. When the old file was a script and the
+  // proposal either anchors on a shared def or still REFERENCES every
+  // omitted one, keep the definitions and adopt the new program body.
+  const missing = [...oldNames].filter((n) => !newNames.has(n));
+  const missingReferenced =
+    missing.length > 0 &&
+    missing.every((name) =>
+      new RegExp(String.raw`\b${name.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`)}\b`).test(
+        proposed,
+      ),
+    );
+  const adoptModuleCode =
+    oldModuleCode && newLooseLines.length > 0 && (shared.length > 0 || missingReferenced);
+
+  // Nothing overlaps: with loose statements in the proposal there is no
+  // anchor to merge on (a rewrite or another file's content). But a
+  // proposal of ONLY new definitions and imports is an addition — "add a
+  // function is_even" answered with just that function must append, not
+  // overwrite-and-lose the rest of the file.
+  if (!shared.length && newLooseLines.length && !adoptModuleCode) return null;
 
   // Protected definitions keep their existing body: on an "add is_even(n)"
   // request a weak model often restates double() with a WRONG body in the
@@ -221,6 +235,31 @@ function mergeBlocks(
     .map((b) => blockText(newLines, b));
 
   const hoisted = missingImports(oldLines, newLines, newBlocks, importLine);
+
+  if (adoptModuleCode) {
+    const sections: string[] = [];
+    const head = [
+      ...oldLines.slice(0, importInsertIndex(oldLines, importLine)).filter((l) => l.trim()),
+      ...hoisted,
+    ];
+    if (head.length) sections.push(head.join('\n'));
+    for (const block of oldBlocks) {
+      const replacement = replacements.get(block.name);
+      sections.push(
+        replacement !== undefined
+          ? preserveExports
+            ? preserveJavaScriptExport(
+                blockText(oldLines, block),
+                blockText(newLines, replacement),
+              )
+            : blockText(newLines, replacement)
+          : blockText(oldLines, block),
+      );
+    }
+    sections.push(...additions);
+    sections.push(newLooseLines.join('\n'));
+    return `${sections.join('\n\n')}\n`;
+  }
 
   const out: string[] = [];
   let cursor = 0;

@@ -1,6 +1,6 @@
 {
   "name": "minervacli",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Terminal chat client and assisted coding companion for Chat Minerva",
   "type": "module",
   "main": "./dist/index.js",
