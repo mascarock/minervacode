@@ -126,6 +126,18 @@ describe('parseToolCalls — code-block Write heuristic (assisted only)', () => 
     expect(parseToolCalls(response, { codeBlockWriteFallback: true }).toolCalls).toEqual([]);
   });
 
+  it('flags an auto-closed trailing fence as suspect truncated', () => {
+    const truncated =
+      'Updated `main.py`:\n\n```python\nnums = [1, 2, 3]\nprint(sorted(nums)\n';
+    const complete = 'Updated `main.py`:\n\n```python\nprint("done")\n```';
+    expect(
+      parseToolCalls(truncated, { codeBlockWriteFallback: true }).suspectTruncated,
+    ).toBe(true);
+    expect(
+      parseToolCalls(complete, { codeBlockWriteFallback: true }).suspectTruncated,
+    ).toBe(false);
+  });
+
   it('accepts a destination filename in the fence info string', () => {
     const response = '```primes.c\n#include <stdio.h>\nint main(void) { return 0; }\n```';
     const result = parseToolCalls(response, { codeBlockWriteFallback: true });

@@ -75,6 +75,8 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
   const [inputHistory, setInputHistory] = useState<string[]>([]);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
+  // Last change-expecting request that produced no change; "yes" resumes it.
+  const pendingIntentRef = useRef<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const changeLogRef = useRef(new ChangeLog());
   const nextId = useRef(1);
@@ -108,6 +110,7 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
       const result = await runAgent(client, {
         history: messagesRef.current,
         prompt: text,
+        pendingIntent: pendingIntentRef.current,
         projectDir,
         permissionMode: permissionMode(),
         language,
@@ -150,6 +153,7 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
         },
       });
       messagesRef.current = result.history;
+      pendingIntentRef.current = result.pendingIntent;
       if (result.verified === false && result.netChanges.length) {
         push({
           kind: 'system',
@@ -181,6 +185,7 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
 
     if (cmd === '/clear') {
       messagesRef.current = [];
+      pendingIntentRef.current = null;
       return push({ kind: 'system', text: 'Conversation cleared.' });
     }
 

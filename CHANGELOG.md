@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.4.3 — 2026-07-15
+
+Techniques adopted from a research sweep over open-source agentic CLIs
+(Aider, Cline/Roo, Open Interpreter, OpenHands, Goose, OpenClaude et al.),
+each filtered against this harness's constraint that prompt-rule additions
+degrade the 7B — everything below is deterministic and harness-side. See
+docs/agent-hardening-backlog.md for what was evaluated and deferred.
+
+- History fence scrub (Aider stale-copy eviction): code fences in older
+  assistant turns are stubbed at run start, so last exercise's code stops
+  being a regurgitation seed (observed live: a prime printer re-emitted
+  for a sorting task).
+- Question-only loop-breaker (Open Interpreter "Proceed"): a fence-less
+  reply that ends by asking ("Would you like me to add that?") on a
+  change-expecting request gets one deterministic "yes — emit the file
+  now" answer instead of dead-ending the turn.
+- Pending-intent register: when a change-expecting run ends with no
+  change, the request is stored; a follow-up bare affirmation ("yes",
+  "good. write", "va bene, procedi") resumes the stored task, so every
+  deterministic gate keys on the real request instead of the word "yes".
+- No-op write breaker (Aider/Goose): a Write identical to the current file
+  is reported as "No change" with the pending verification error restated;
+  three consecutive no-ops stop the run honestly.
+- Identical-error three-strike (OpenHands): the same verification failure
+  (normalized: paths, addresses, timings, source-echo lines stripped)
+  three runs in a row stops the run instead of burning the verify budget.
+- Truncation guard (OpenClaude): an auto-closed trailing fence marks its
+  Write as suspect — auto mode refuses it once and asks for a complete
+  resend; assisted mode warns the student before approval.
+- Undefined-name lint (SWE-agent lineage): after assisted Python writes, a
+  scope-aware stdlib-only AST check flags NameError-class typos
+  ("[int(i) for I in nums]") that py_compile cannot see. Advisory only.
+
 ## 0.4.2 — 2026-07-15
 
 Fixes three assisted-mode failures observed live (a prose paragraph was

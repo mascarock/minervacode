@@ -15,6 +15,11 @@ export interface ParseResult {
   toolCalls: ParsedToolCall[];
   /** Model response with tool blocks removed. */
   text: string;
+  /**
+   * The final fence never closed — generation was likely cut off, so the
+   * last code-block Write may hold half a file.
+   */
+  suspectTruncated: boolean;
 }
 
 export interface ParseOptions {
@@ -468,20 +473,21 @@ function parseCodeBlockLayer(
  * Closes a trailing fence the model never closed (it stopped generating or
  * rambled off). Without this the final — often only — code block is lost.
  */
-function closeUnfinishedFence(response: string): string {
+function closeUnfinishedFence(response: string): { text: string; closed: boolean } {
   const delimiters = response.match(/```/g)?.length ?? 0;
-  if (delimiters % 2 === 0) return response;
+  if (delimiters % 2 === 0) return { text: response, closed: false };
   // Only a fence that actually started content can be closed meaningfully.
   const last = response.lastIndexOf('```');
-  if (!response.slice(last).includes('\n')) return response;
-  return `${response.replace(/\n?$/, '\n')}\`\`\``;
+  if (!response.slice(last).includes('\n')) return { text: response, closed: false };
+  return { text: `${response.replace(/\n?$/, '\n')}\`\`\``, closed: true };
 }
 
 export function parseToolCalls(response: string, options: ParseOptions = {}): ParseResult {
   const knowsTool = (name: string) =>
     !options.knownTools || options.knownTools.some((t) => t.toLowerCase() === name.toLowerCase());
 
-  response = closeUnfinishedFence(unwrapMarkdownWrapper(response));
+  const repaired = closeUnfinishedFence(unwrapMarkdownWrapper(response));
+  response = repaired.text;
   let calls = parseXmlLayer(response);
   // XML blocks that only name hallucinated tools must not shadow the
   // fallback layers — but still strip them from the visible text.
@@ -505,5 +511,5 @@ export function parseToolCalls(response: string, options: ParseOptions = {}): Pa
   }
   text = text.replaceAll(/\n{3,}/g, '\n\n').trim();
 
-  return { toolCalls: calls, text };
+  return { toolCalls: calls, text, suspectTruncated: repaired.closed };
 }

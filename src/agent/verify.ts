@@ -100,6 +100,125 @@ export function syntaxCheckCommand(changedPaths: string[]): VerifyCommand | null
 }
 
 /**
+ * Scope-aware "possibly undefined name" checker (poor man's pyflakes,
+ * stdlib-only). Deliberately conservative: order-insensitive binding
+ * collection, class scopes visible to children, global/nonlocal treated as
+ * bindings, wildcard imports disable the file — a false positive would
+ * block valid student code, a miss only loses an advisory warning. Catches
+ * the observed typo class: `[int(i) for I in nums]` with no `i` in scope.
+ */
+const PY_NAME_CHECK = [
+  'import ast, builtins, sys',
+  '',
+  "BUILTINS = set(dir(builtins)) | {'__file__', '__name__', '__doc__', '__builtins__',",
+  "    '__package__', '__spec__', '__loader__', '__debug__', '__annotations__'}",
+  '',
+  'class S:',
+  '    def __init__(self, parent):',
+  '        self.parent, self.bound, self.loads = parent, set(), []',
+  '',
+  'def check(path):',
+  '    try:',
+  "        with open(path, encoding='utf-8') as fh:",
+  '            tree = ast.parse(fh.read(), path)',
+  '    except Exception:',
+  '        return [], False',
+  '    scopes, wildcard = [], [False]',
+  '',
+  '    def bind_args(sc, a):',
+  '        for arg in list(getattr(a, "posonlyargs", [])) + list(a.args) + list(a.kwonlyargs):',
+  '            sc.bound.add(arg.arg)',
+  '        if a.vararg: sc.bound.add(a.vararg.arg)',
+  '        if a.kwarg: sc.bound.add(a.kwarg.arg)',
+  '',
+  '    def visit(node, sc):',
+  '        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):',
+  '            sc.bound.add(node.name)',
+  '            for d in node.decorator_list: visit(d, sc)',
+  '            for d in node.args.defaults + [k for k in node.args.kw_defaults if k]: visit(d, sc)',
+  '            inner = S(sc); scopes.append(inner); bind_args(inner, node.args)',
+  '            for child in node.body: visit(child, inner)',
+  '            return',
+  '        if isinstance(node, ast.Lambda):',
+  '            inner = S(sc); scopes.append(inner); bind_args(inner, node.args)',
+  '            visit(node.body, inner)',
+  '            return',
+  '        if isinstance(node, ast.ClassDef):',
+  '            sc.bound.add(node.name)',
+  '            for d in node.decorator_list + node.bases: visit(d, sc)',
+  '            for k in node.keywords: visit(k.value, sc)',
+  '            inner = S(sc); scopes.append(inner)',
+  '            for child in node.body: visit(child, inner)',
+  '            return',
+  '        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):',
+  '            inner = S(sc); scopes.append(inner)',
+  '            for gen in node.generators:',
+  '                visit(gen.iter, sc)',
+  '                for n in ast.walk(gen.target):',
+  '                    if isinstance(n, ast.Name): inner.bound.add(n.id)',
+  '                for cond in gen.ifs: visit(cond, inner)',
+  '            if isinstance(node, ast.DictComp):',
+  '                visit(node.key, inner); visit(node.value, inner)',
+  '            else:',
+  '                visit(node.elt, inner)',
+  '            return',
+  '        if isinstance(node, (ast.Import, ast.ImportFrom)):',
+  '            for alias in node.names:',
+  "                if alias.name == '*': wildcard[0] = True",
+  "                else: sc.bound.add((alias.asname or alias.name).split('.')[0])",
+  '            return',
+  '        if isinstance(node, (ast.Global, ast.Nonlocal)):',
+  '            for name in node.names: sc.bound.add(name)',
+  '            return',
+  '        if isinstance(node, ast.ExceptHandler) and node.name:',
+  '            sc.bound.add(node.name)',
+  '        if isinstance(node, ast.Name):',
+  '            if isinstance(node.ctx, ast.Load):',
+  '                sc.loads.append((node.lineno, node.id))',
+  '            else:',
+  '                sc.bound.add(node.id)',
+  '            return',
+  "        for attr in ('name', 'rest'):",
+  "            if node.__class__.__name__.startswith('Match') and isinstance(getattr(node, attr, None), str):",
+  '                sc.bound.add(getattr(node, attr))',
+  '        for child in ast.iter_child_nodes(node):',
+  '            visit(child, sc)',
+  '',
+  '    root = S(None); scopes.append(root)',
+  '    for child in tree.body: visit(child, root)',
+  '    problems = set()',
+  '    for sc in scopes:',
+  '        for line, name in sc.loads:',
+  '            if name in BUILTINS: continue',
+  '            cur = sc',
+  '            while cur and name not in cur.bound: cur = cur.parent',
+  '            if cur is None: problems.add((line, name))',
+  '    return sorted(problems), wildcard[0]',
+  '',
+  'failures = 0',
+  'for target in sys.argv[1:]:',
+  '    found, wildcard = check(target)',
+  '    if wildcard: continue',
+  '    for line, name in found:',
+  '        failures += 1',
+  '        print("%s:%d: possibly undefined name %r" % (target, line, name))',
+  'sys.exit(1 if failures else 0)',
+].join('\n');
+
+/**
+ * Advisory undefined-name check for changed Python files, or null when
+ * none apply. Read-only: parses the AST, never executes the program.
+ */
+export function undefinedNameCheckCommand(changedPaths: string[]): VerifyCommand | null {
+  const py = [...new Set(changedPaths)].filter((p) => p.endsWith('.py'));
+  if (!py.length) return null;
+  return {
+    command: `python3 - ${py.map(quote).join(' ')} <<'MINERVA_NAMECHECK'\n${PY_NAME_CHECK}\nMINERVA_NAMECHECK`,
+    source: 'undefined-name check',
+  };
+}
+
+/**
  * Picks the command the harness runs to verify the agent's file changes.
  * Priority: explicit Test command in .minervacli.md, then the project's
  * test setup, then a syntax check of the changed files.

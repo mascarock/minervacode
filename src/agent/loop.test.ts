@@ -8,6 +8,7 @@ import type { ChatMessage } from '../types.js';
 import {
   MAX_VERIFY_RUNS,
   definesIdentifier,
+  isBareAffirmation,
   requestExplicitSourcePaths,
   requestAllowsNewFile,
   requestExpectsChanges,
@@ -180,6 +181,253 @@ describe('requestExplicitSourcePaths', () => {
       'primes.c',
     ]);
     expect(requestExplicitSourcePaths('Create primes.c.')).toEqual(['primes.c']);
+  });
+});
+
+describe('isBareAffirmation', () => {
+  it.each(['yes', 'Yes!', 'ok', 'good. write', 'go ahead', 'sì', 'va bene, procedi', 'do it now'])(
+    'recognizes: %s',
+    (text) => {
+      expect(isBareAffirmation(text)).toBe(true);
+    },
+  );
+
+  it.each([
+    'Write a program that sorts three numbers.',
+    'yes, but use bubble sort instead',
+    'why?',
+    'Explain how sorting works.',
+    '',
+  ])('rejects: %s', (text) => {
+    expect(isBareAffirmation(text)).toBe(false);
+  });
+});
+
+describe('pending intent across turns', () => {
+  it('returns the unfulfilled request as pendingIntent when nothing was applied', async () => {
+    const projectDir = await tempProject();
+    const prompt = 'Python script that asks for the user input of 5 numbers and then it sort';
+
+    const result = await runAgent(mockClient(['Sure, ready when you are.']), {
+      history: [],
+      prompt,
+      projectDir,
+      permissionMode: 'default',
+      language: 'en',
+      events: {
+        onText() {},
+        onToolStart() {},
+        onToolEnd() {},
+        async confirm() {
+          return true;
+        },
+      },
+    });
+
+    expect(result.pendingIntent).toBe(prompt);
+  });
+
+  it('a bare affirmation resumes the stored intent and applies the write', async () => {
+    const projectDir = await tempProject();
+    const intent = 'Python script that asks for the user input of 5 numbers and then it sort';
+    const requestBodies: unknown[] = [];
+    // A filename-less python fence: only fallbackNewFile (driven by the
+    // ORIGINAL intent, not by "yes") can turn it into main.py.
+    const responses = ['```python\nnums = sorted(int(input()) for _ in range(5))\nprint(nums)\n```'];
+
+    const result = await runAgent(mockClient(responses, requestBodies), {
+      history: [
+        { role: 'user', content: intent },
+        { role: 'assistant', content: 'Would you like me to also validate the input?' },
+      ],
+      prompt: 'yes',
+      pendingIntent: intent,
+      projectDir,
+      permissionMode: 'default',
+      language: 'en',
+      events: {
+        onText() {},
+        onToolStart() {},
+        onToolEnd() {},
+        async confirm() {
+          return true;
+        },
+      },
+    });
+
+    expect(existsSync(path.join(projectDir, 'main.py'))).toBe(true);
+    expect(JSON.stringify(requestBodies[0])).toContain('5 numbers');
+    expect(result.pendingIntent).toBeNull();
+  });
+
+  it('clears pendingIntent after a successful change', async () => {
+    const projectDir = await tempProject();
+    const result = await runAgent(
+      mockClient(['Updated `main.py`:\n\n```python\nprint("hi")\n```']),
+      {
+        history: [],
+        prompt: 'Write me a program that prints hi.',
+        projectDir,
+        permissionMode: 'default',
+        language: 'en',
+        events: {
+          onText() {},
+          onToolStart() {},
+          onToolEnd() {},
+          async confirm() {
+            return true;
+          },
+        },
+      },
+    );
+    expect(result.pendingIntent).toBeNull();
+  });
+});
+
+describe('no-op write breaker', () => {
+  const identicalWrite = (content: string) =>
+    `<minerva_tool name="Write">\n<path>main.py</path>\n<content>\n${content}</content>\n</minerva_tool>`;
+
+  it('tells the model a Write changed nothing and stops after three no-ops', async () => {
+    const projectDir = await tempProject();
+    const content = 'print("hi")\n';
+    await writeFile(path.join(projectDir, 'main.py'), content);
+
+    const requestBodies: unknown[] = [];
+    // The model re-sends the exact current file contents forever.
+    const responses = Array.from({ length: 8 }, () => identicalWrite(content));
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+
+    await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Fix main.py so it prints hi.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events,
+    });
+
+    // Feedback: the model is told the write was a no-op…
+    expect(JSON.stringify(requestBodies)).toContain('No change: main.py already contains');
+    // …and the run stops instead of burning all 20 turns.
+    expect(requestBodies.length).toBeLessThanOrEqual(4);
+    expect(statuses.some((s) => s.startsWith('⚠') && /identical/i.test(s))).toBe(true);
+  });
+
+  it('a real change resets the no-op counter', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'main.py'), 'print("a")\n');
+
+    const responses = [
+      identicalWrite('print("a")\n'),
+      identicalWrite('print("a")\n'),
+      identicalWrite('print("b")\n'), // real change — counter resets
+      'Done. The file now prints b.',
+    ];
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+
+    const result = await runAgent(mockClient(responses), {
+      history: [],
+      prompt: 'Fix main.py so it prints b.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events,
+    });
+
+    expect(statuses.some((s) => s.startsWith('⚠') && /identical/i.test(s))).toBe(false);
+    expect(result.changes.length).toBeGreaterThan(0);
+  });
+});
+
+describe('identical verification error three-strike stop', () => {
+  const brokenWrite = (comment: string) =>
+    `<minerva_tool name="Write">\n<path>main.py</path>\n<content>\nraise ValueError("boom")  # ${comment}\n</content>\n</minerva_tool>`;
+
+  it('stops after the same verification error three times despite file changes', async () => {
+    const projectDir = await tempProject();
+    // Each attempt changes the file (new comment) but fails identically.
+    const responses = [
+      brokenWrite('v1'),
+      brokenWrite('v2'),
+      brokenWrite('v3'),
+      brokenWrite('v4'),
+      brokenWrite('v5'),
+      'Giving up.',
+    ];
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+
+    const result = await runAgent(mockClient(responses), {
+      history: [],
+      prompt: 'Write me a program that prints ok.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events,
+    });
+
+    const verifyRuns = statuses.filter((s) => s.startsWith('Verifying changes')).length;
+    expect(verifyRuns).toBeLessThanOrEqual(3);
+    expect(statuses.some((s) => s.startsWith('⚠') && /identical error/i.test(s))).toBe(true);
+    expect(result.status).toBe('requirements-unmet');
+  }, 60_000);
+});
+
+describe('truncated fence handling', () => {
+  it('auto mode refuses a truncated Write once and applies the resent complete file', async () => {
+    const projectDir = await tempProject();
+    const responses = [
+      // Generation cut off mid-file: the fence never closes.
+      'Updated `main.py`:\n\n```python\nprint("part one")\n',
+      'Updated `main.py`:\n\n```python\nprint("part one")\nprint("part two")\n```',
+    ];
+    const requestBodies: unknown[] = [];
+
+    await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Write me a program that prints two parts.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    expect(await readFile(path.join(projectDir, 'main.py'), 'utf-8')).toBe(
+      'print("part one")\nprint("part two")\n',
+    );
+    expect(JSON.stringify(requestBodies)).toContain('cut off');
+  });
+
+  it('assisted mode warns about a truncated Write but leaves the student in charge', async () => {
+    const projectDir = await tempProject();
+    const responses = ['Updated `main.py`:\n\n```python\nprint("half a progr\n'];
+    const statuses: string[] = [];
+
+    await runAgent(mockClient(responses), {
+      history: [],
+      prompt: 'Write me a program that prints something.',
+      projectDir,
+      permissionMode: 'default',
+      language: 'en',
+      events: {
+        onText() {},
+        onToolStart() {},
+        onToolEnd() {},
+        onStatus: (text) => statuses.push(text),
+        async confirm() {
+          return true;
+        },
+      },
+    });
+
+    expect(statuses.some((s) => s.startsWith('⚠') && /cut off|incomplete/i.test(s))).toBe(true);
+    expect(existsSync(path.join(projectDir, 'main.py'))).toBe(true);
   });
 });
 
@@ -1020,9 +1268,10 @@ describe('autonomous agent loop', () => {
     await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
     // One more change than the verification budget can cover must downgrade
     // the stale passing result instead of claiming the latest state passed.
+    // Each version verifies green so the budget is spent on PASSING runs.
     const responses = Array.from(
       { length: MAX_VERIFY_RUNS + 1 },
-      (_, i) => `Updated \`calc.py\`:\n\n\`\`\`python\nx = ${i + 2}\n\`\`\``,
+      (_, i) => `Updated \`calc.py\`:\n\n\`\`\`python\nx = ${i + 2}\nprint(x)\n\`\`\``,
     );
     responses.push('Done.', 'LGTM');
     const client = mockClient(responses);
@@ -1037,7 +1286,7 @@ describe('autonomous agent loop', () => {
     });
 
     expect(await readFile(path.join(projectDir, 'calc.py'), 'utf-8')).toBe(
-      `x = ${MAX_VERIFY_RUNS + 2}\n`,
+      `x = ${MAX_VERIFY_RUNS + 2}\nprint(x)\n`,
     );
     expect(result.verified).toBe(false);
   });
@@ -1127,6 +1376,34 @@ describe('autonomous agent loop', () => {
     expect(requestBodies).toHaveLength(1);
   });
 
+  it('warns about a possibly undefined name after an assisted write', async () => {
+    const projectDir = await tempProject();
+    // Syntactically valid, crashes at runtime: comprehension binds I, loads i.
+    const responses = [
+      'Updated `main.py`:\n\n```python\nnums = input().split()\nnums = [int(i) for I in nums]\nprint(nums)\n```',
+    ];
+    const statuses: string[] = [];
+
+    await runAgent(mockClient(responses), {
+      history: [],
+      prompt: 'Write me a program that reads numbers and prints them.',
+      projectDir,
+      permissionMode: 'default',
+      language: 'en',
+      events: {
+        onText() {},
+        onToolStart() {},
+        onToolEnd() {},
+        onStatus: (text) => statuses.push(text),
+        async confirm() {
+          return true;
+        },
+      },
+    });
+
+    expect(statuses.some((s) => s.startsWith('⚠') && /undefined name/i.test(s))).toBe(true);
+  });
+
   it('stays quiet when an assisted code-block write compiles cleanly', async () => {
     const projectDir = await tempProject();
     const responses = ['Updated `main.py`:\n\n```python\nprint("hi")\n```'];
@@ -1150,6 +1427,92 @@ describe('autonomous agent loop', () => {
     });
 
     expect(statuses.filter((s) => s.startsWith('⚠'))).toEqual([]);
+  });
+
+  it('scrubs stale assistant code fences from history before calling the model', async () => {
+    const projectDir = await tempProject();
+    const requestBodies: unknown[] = [];
+    const responses = ['Updated `main.py`:\n\n```python\nnums = sorted(int(input()) for _ in range(3))\nprint(sum(nums))\n```'];
+
+    await runAgent(mockClient(responses, requestBodies), {
+      history: [
+        { role: 'user', content: 'Print the first 3 primes.' },
+        {
+          role: 'assistant',
+          content: 'Here you go:\n\n```python\ndef is_prime(n):\n    return n > 1\n\nprint(is_prime(7))\n```',
+        },
+        { role: 'user', content: 'thanks' },
+        { role: 'assistant', content: 'You are welcome!' },
+      ],
+      prompt: 'Now write a program that asks for three numbers, sorts them and prints the sum.',
+      projectDir,
+      permissionMode: 'default',
+      language: 'en',
+      events: {
+        onText() {},
+        onToolStart() {},
+        onToolEnd() {},
+        async confirm() {
+          return true;
+        },
+      },
+    });
+
+    expect(JSON.stringify(requestBodies[0])).not.toContain('is_prime');
+  });
+
+  it('nudges once when the model stalls with a question instead of acting', async () => {
+    const projectDir = await tempProject();
+    const responses = [
+      'Great! Just one more thing to ensure everything works smoothly: let’s include a quick check at the end to see if the user actually entered five distinct integers. Would you like me to add that?',
+      'Updated `main.py`:\n\n```python\nnums = sorted(int(input()) for _ in range(5))\nprint(nums)\n```',
+    ];
+    const requestBodies: unknown[] = [];
+
+    await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Python script that asks for the user input of 5 numbers and then it sort',
+      projectDir,
+      permissionMode: 'default',
+      language: 'en',
+      events: {
+        onText() {},
+        onToolStart() {},
+        onToolEnd() {},
+        async confirm() {
+          return true;
+        },
+      },
+    });
+
+    expect(requestBodies).toHaveLength(2);
+    expect(existsSync(path.join(projectDir, 'main.py'))).toBe(true);
+  });
+
+  it('does not fight questions on informational requests', async () => {
+    const projectDir = await tempProject();
+    const requestBodies: unknown[] = [];
+
+    await runAgent(
+      mockClient(['Do you mean the built-in sorted() function?'], requestBodies),
+      {
+        history: [],
+        prompt: 'Explain how sorting works in Python.',
+        projectDir,
+        permissionMode: 'default',
+        language: 'en',
+        events: {
+          onText() {},
+          onToolStart() {},
+          onToolEnd() {},
+          async confirm() {
+            return true;
+          },
+        },
+      },
+    );
+
+    expect(requestBodies).toHaveLength(1);
   });
 
   it('nudges once when the model refuses claiming it cannot write files', async () => {

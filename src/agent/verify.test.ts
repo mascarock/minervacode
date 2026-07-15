@@ -7,6 +7,7 @@ import {
   requestRequiresExecution,
   runVerification,
   syntaxCheckCommand,
+  undefinedNameCheckCommand,
 } from './verify.js';
 
 const dirs: string[] = [];
@@ -336,6 +337,80 @@ describe('syntaxCheckCommand', () => {
   it('returns null when no changed file has a checkable syntax', () => {
     expect(syntaxCheckCommand(['notes.md', 'data.csv'])).toBeNull();
     expect(syntaxCheckCommand([])).toBeNull();
+  });
+});
+
+describe('undefinedNameCheckCommand', () => {
+  it('returns null when no python file changed', () => {
+    expect(undefinedNameCheckCommand(['app.js', 'notes.md'])).toBeNull();
+    expect(undefinedNameCheckCommand([])).toBeNull();
+  });
+
+  it('flags the live-observed comprehension typo (for I in nums, int(i))', async () => {
+    const dir = await tempProject();
+    // Exact bug class from the live transcript: `i` is bound only inside
+    // is_prime's scope; the module-level comprehension binds `I` but loads `i`.
+    await writeFile(
+      path.join(dir, 'main.py'),
+      [
+        'def is_prime(n):',
+        '    for i in range(2, n):',
+        '        if n % i == 0:',
+        '            return False',
+        '    return True',
+        '',
+        'nums = input().split()',
+        'nums = [int(i) for I in nums]',
+        'print(nums)',
+        '',
+      ].join('\n'),
+    );
+    const cmd = undefinedNameCheckCommand(['main.py']);
+    expect(cmd).not.toBeNull();
+    const { ok, output } = await runVerification(cmd!, dir);
+    expect(ok).toBe(false);
+    expect(output).toContain("'i'");
+  });
+
+  it('stays quiet on legitimate python constructs', async () => {
+    const dir = await tempProject();
+    await writeFile(
+      path.join(dir, 'main.py'),
+      [
+        'import math',
+        'from os import path as osp',
+        '',
+        'TOTAL = 0',
+        '',
+        'def outer(a, *args, key=None, **kwargs):',
+        '    global TOTAL',
+        '    TOTAL += a',
+        '    inner = lambda x: x * a',
+        '    return [inner(v) for v in args if key is None or key(v)]',
+        '',
+        'class Counter:',
+        '    start = 0',
+        '    def bump(self, by=1):',
+        '        self.start += by',
+        '        return self.start',
+        '',
+        'try:',
+        '    values = [int(s) for s in input().split()]',
+        'except ValueError as err:',
+        '    print(f"bad input: {err}")',
+        'else:',
+        '    with open(osp.join(".", "out.txt"), "w") as fh:',
+        '        fh.write(str(sorted(values, key=math.fabs)))',
+        '    while (n := len(values)) > 0:',
+        '        values.pop()',
+        '    print(TOTAL, Counter().bump(), n)',
+        '',
+      ].join('\n'),
+    );
+    const cmd = undefinedNameCheckCommand(['main.py']);
+    const { ok, output } = await runVerification(cmd!, dir);
+    expect(output).not.toContain('possibly undefined');
+    expect(ok).toBe(true);
   });
 });
 

@@ -111,6 +111,25 @@ function compactBulk(content: string, aggressive: boolean): string {
   return compactCodeFences(compactToolCalls(compactToolResults(content, aggressive)));
 }
 
+/**
+ * Stubs code fences in all but the newest ASSISTANT message. Old code
+ * proposals sitting verbatim in history are the model's main regurgitation
+ * seed: asked for a sorting exercise it re-emits last week's prime printer.
+ * User-pasted fences are the student's own context and stay intact.
+ */
+export function scrubStaleAssistantFences(messages: ChatMessage[]): ChatMessage[] {
+  const lastAssistant = messages.findLastIndex((m) => m.role === 'assistant');
+  let changed = false;
+  const scrubbed = messages.map((message, index) => {
+    if (message.role !== 'assistant' || index === lastAssistant) return message;
+    const content = compactCodeFences(message.content);
+    if (content === message.content) return message;
+    changed = true;
+    return { ...message, content };
+  });
+  return changed ? scrubbed : messages;
+}
+
 function meaningfulMessageStub(message: ChatMessage): string {
   const withoutBulk = compactBulk(message.content, true).trim();
   if (message.role === 'user') {

@@ -5,9 +5,51 @@ import {
   estimateTextTokens,
   formatContextStats,
   getContextStats,
+  scrubStaleAssistantFences,
 } from './compact.js';
 
 const message = (role: ChatMessage['role'], content: string): ChatMessage => ({ role, content });
+
+describe('scrubStaleAssistantFences', () => {
+  const primeFence =
+    'Here is the solution:\n\n```python\ndef is_prime(n):\n    return n > 1\n\nprint(is_prime(7))\n```\n\nDone!';
+
+  it('stubs code fences in older assistant turns', () => {
+    const messages = [
+      message('user', 'Print the first primes.'),
+      message('assistant', primeFence),
+      message('user', 'Now write a program that sorts three numbers.'),
+      message('assistant', 'Sure, which order?'),
+    ];
+    const scrubbed = scrubStaleAssistantFences(messages);
+    expect(scrubbed[1].content).not.toContain('is_prime');
+    expect(scrubbed[1].content).toContain('```');
+    expect(scrubbed[1].content).toContain('Here is the solution:');
+  });
+
+  it('keeps the newest assistant turn and all user turns intact', () => {
+    const userFence = 'My file:\n\n```python\nx = my_secret()\n```';
+    const messages = [
+      message('user', userFence),
+      message('assistant', primeFence),
+      message('user', 'Thanks.'),
+      message('assistant', primeFence),
+    ];
+    const scrubbed = scrubStaleAssistantFences(messages);
+    expect(scrubbed[0].content).toBe(userFence);
+    expect(scrubbed[1].content).not.toContain('is_prime');
+    expect(scrubbed[3].content).toBe(primeFence);
+  });
+
+  it('returns the same array when nothing needs scrubbing', () => {
+    const messages = [
+      message('user', 'hello'),
+      message('assistant', 'plain prose reply'),
+      message('assistant', primeFence),
+    ];
+    expect(scrubStaleAssistantFences(messages)).toBe(messages);
+  });
+});
 
 describe('context compaction', () => {
   it('returns untouched history while it is inside the budget', () => {

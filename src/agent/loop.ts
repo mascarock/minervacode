@@ -20,8 +20,9 @@ import {
   requestRequiresExecution,
   runVerification,
   syntaxCheckCommand,
+  undefinedNameCheckCommand,
 } from './verify.js';
-import { compactMessages } from './compact.js';
+import { compactMessages, scrubStaleAssistantFences } from './compact.js';
 import { buildRepoMap } from './repo-map.js';
 import {
   buildSystemPrompt,
@@ -172,6 +173,11 @@ export interface AgentEvents {
 export interface AgentOptions {
   history: ChatMessage[];
   prompt: string;
+  /**
+   * The last change-expecting request that produced no change. When the new
+   * prompt is a bare affirmation ("yes", "good. write"), this is the task.
+   */
+  pendingIntent?: string | null;
   projectDir: string;
   permissionMode: PermissionMode;
   /** Reply language. Auto follows the language of the latest user message. */
@@ -204,6 +210,11 @@ export interface AgentResult {
   verification: VerificationEvidence | null;
   /** Net first-to-final contents per changed file, for diffs and rollback. */
   netChanges: NetChange[];
+  /**
+   * The effective request when it expected changes but none were applied —
+   * pass back in on the next call so "yes" resumes this task.
+   */
+  pendingIntent: string | null;
 }
 
 export interface VerificationEvidence {
@@ -259,6 +270,20 @@ async function executeCall(
   }
 }
 
+/** Volatile bits (paths, addresses, timings) stripped so identical verification failures compare equal. */
+function normalizeVerifyOutput(output: string, projectDir: string): string {
+  return output
+    .replaceAll(projectDir, '')
+    .replace(/0x[0-9a-fA-F]+/g, '0x…')
+    .replace(/\b\d+(?:\.\d+)?\s*s(?:econds?)?\b/g, '·s')
+    .split('\n')
+    // Tracebacks echo the failing source line (deeply indented); cosmetic
+    // rewrites of that line must not make the same error look new.
+    .filter((line) => !/^\s{3,}/.test(line))
+    .join('\n')
+    .trim();
+}
+
 /** First line of a multi-line command, for status/tool display. */
 function compactCommand(command: string): string {
   const [first, ...rest] = command.split('\n');
@@ -286,6 +311,21 @@ const CAPABILITY_REFUSAL =
 const UNFENCED_CODE =
   /^[ \t]*(?:def\s+\w+\s*\(|class\s+\w+\s*[:({]|from\s+[\w.]+\s+import\s|#include\s*[<"]|function\s+\w+\s*\(|(?:int|void)\s+main\s*\()/m;
 
+/** The model stalls with a question/offer instead of acting. */
+const QUESTION_OFFER =
+  /\b(?:would you like|do you want|shall i|should i|vuoi(?: che)?|desideri|preferisci|posso procedere|procedo)\b/i;
+
+/** A reply that only converses: no fence, no code, ends by asking. */
+function isQuestionOnlyReply(response: string): boolean {
+  if (response.includes('```') || UNFENCED_CODE.test(response)) return false;
+  const lastLine = response
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .at(-1);
+  return !!lastLine && (lastLine.endsWith('?') || QUESTION_OFFER.test(response));
+}
+
 /** The request asks for a program that READS USER INPUT. */
 const EXPECTS_USER_INPUT =
   /\b(?:chied\w*|inserisc\w*|inserire|ask(?:s|ing)?\b|prompt(?:s|ing)?\s+(?:the\s+)?user)\b/i;
@@ -293,6 +333,29 @@ const EXPECTS_USER_INPUT =
 /** Does any changed Python file actually read from stdin? */
 function readsUserInput(contents: string[]): boolean {
   return contents.some((c) => /\binput\s*\(|\bsys\.stdin\b|\braw_input\s*\(/.test(c));
+}
+
+/**
+ * "yes" / "good. write" / "va bene, procedi" — a go-ahead carrying no task
+ * of its own. Every deterministic gate keyed on the prompt would otherwise
+ * evaluate the affirmation as the task and disarm itself.
+ */
+const AFFIRMATION_WORDS = new Set([
+  'yes', 'yep', 'yeah', 'ok', 'okay', 'sure', 'good', 'great', 'perfect', 'fine',
+  'go', 'ahead', 'do', 'it', 'now', 'please', 'proceed', 'continue', 'write', 'apply',
+  'si', 'sì', 'va', 'bene', 'procedi', 'continua', 'scrivi', 'scrivilo', 'fallo',
+  'applica', 'ora', 'dai', 'certo', 'perfetto',
+]);
+
+export function isBareAffirmation(text: string): boolean {
+  const words = text
+    .toLowerCase()
+    .replace(/[.,!;:]+/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+  return (
+    words.length > 0 && words.length <= 5 && words.every((word) => AFFIRMATION_WORDS.has(word))
+  );
 }
 
 /** One-time correction when the model showed code but nothing was applicable. */
@@ -320,11 +383,15 @@ Only use file paths that exist in the project listing (or clearly new files). Re
 export async function runAgent(client: MinervaClient, opts: AgentOptions): Promise<AgentResult> {
   const tools = getTools();
   const auto = opts.permissionMode === 'dontAsk';
+  // "yes" carries no task: every gate below keys on the prompt, so a bare
+  // go-ahead resumes the stored unfulfilled request instead.
+  const prompt =
+    opts.pendingIntent && isBareAffirmation(opts.prompt) ? opts.pendingIntent : opts.prompt;
   const selfReview = opts.review ?? auto;
   opts.events.onStatus?.('Mapping repository context…');
   const [projectContext, repoMap] = await Promise.all([
     loadProjectContext(opts.projectDir),
-    buildRepoMap({ projectDir: opts.projectDir, query: opts.prompt }),
+    buildRepoMap({ projectDir: opts.projectDir, query: prompt }),
   ]);
   const projectFiles = repoMap.files;
   const knownProjectFiles = new Set(projectFiles.map((file) => file.replace(/^\.\//, '')));
@@ -332,8 +399,8 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   // create it (for example, "fix calc.py; the error mentions missing.py").
   // Only enforce absent paths when the request actually authorizes creating
   // a file.
-  const requiredNewPaths = requestAllowsNewFile(opts.prompt)
-    ? requestExplicitSourcePaths(opts.prompt).filter((file) => !knownProjectFiles.has(file))
+  const requiredNewPaths = requestAllowsNewFile(prompt)
+    ? requestExplicitSourcePaths(prompt).filter((file) => !knownProjectFiles.has(file))
     : [];
   const projectHasSourceFiles = projectFiles.some((file) => SOURCE_FILE_PATH.test(file));
   const { files: fileContents, skipped } = await loadProjectFileContents(
@@ -353,7 +420,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   // context stays in a separate turn so old file snapshots can be compacted.
   const firstTurn = opts.history.length === 0;
   let initialVerification: { command: string; output: string } | undefined;
-  if (auto && firstTurn && requestExpectsChanges(opts.prompt)) {
+  if (auto && firstTurn && requestExpectsChanges(prompt)) {
     const cmd = await detectVerifyCommand(opts.projectDir, projectFiles, []);
     if (cmd && /test|pytest|unittest|\.minervacli\.md/i.test(cmd.source)) {
       const bash = getTool('Bash');
@@ -370,21 +437,24 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     }
   }
   const requestedCProgram =
-    requestRequiresExecution(opts.prompt) &&
+    requestRequiresExecution(prompt) &&
     requiredNewPaths.some((file) => /\.(?:c|cc|cpp|cxx)$/i.test(file));
   const acceptanceRequirements = requiredNewPaths.length
-    ? `\n\nHard acceptance requirement: create the exact requested path${requiredNewPaths.length === 1 ? '' : 's'} ${requiredNewPaths.join(', ')}. Do not substitute another filename.${requestRequiresExecution(opts.prompt) ? ' This is a small standalone program: keep each file under 80 lines, use direct standard-language control flow, and emit the complete file action now before any explanation.' : ''}${requestedCProgram ? ' C/C++ hygiene: use a conventional main entry point, include every standard header you use, keep identifier casing consistent, and prefer small bounded loops and helpers over recursion, variable-length arrays, or pointer tricks.' : ''}`
+    ? `\n\nHard acceptance requirement: create the exact requested path${requiredNewPaths.length === 1 ? '' : 's'} ${requiredNewPaths.join(', ')}. Do not substitute another filename.${requestRequiresExecution(prompt) ? ' This is a small standalone program: keep each file under 80 lines, use direct standard-language control flow, and emit the complete file action now before any explanation.' : ''}${requestedCProgram ? ' C/C++ hygiene: use a conventional main entry point, include every standard header you use, keep identifier casing consistent, and prefer small bounded loops and helpers over recursion, variable-length arrays, or pointer tricks.' : ''}`
     : '';
   const userContent = `${languageInstruction(opts.language)}\n\n${buildTurnPrompt({
-    request: opts.prompt,
+    request: prompt,
     repositoryMap: repoMap.map,
     fileContents,
     skippedFiles: skipped,
     initialVerification,
   })}${acceptanceRequirements}`;
 
+  // Old assistant code proposals in history are the model's main
+  // regurgitation seed (observed live: a prime printer re-emitted for a
+  // sorting exercise). Stub them; the files on disk are authoritative.
   let messages: ChatMessage[] = [
-    ...opts.history,
+    ...scrubStaleAssistantFences(opts.history),
     ...(firstTurn
       ? [
           { role: 'user' as const, content: instructions },
@@ -411,14 +481,19 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   let failedVerificationNudgeSerial = -1;
   let failedVerificationNudges = 0;
   let nudged = false;
+  let questionNudged = false;
+  let truncationNudges = 0;
+  let consecutiveNoopWrites = 0;
+  const verifyFailSignatures: string[] = [];
+  let stuckOnIdenticalError = false;
   let requirementsNudges = 0;
   let missingDefNudges = 0;
   let inputNudges = 0;
-  const requiredDefs = requestExpectsChanges(opts.prompt)
-    ? requestRequiredDefinitions(opts.prompt)
+  const requiredDefs = requestExpectsChanges(prompt)
+    ? requestRequiredDefinitions(prompt)
     : [];
   const requiresUserInput =
-    requestExpectsChanges(opts.prompt) && EXPECTS_USER_INPUT.test(opts.prompt);
+    requestExpectsChanges(prompt) && EXPECTS_USER_INPUT.test(prompt);
   let reviewed = false;
   let compactionReported = false;
 
@@ -449,13 +524,14 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       { role: 'assistant', content: AGENT_ACKNOWLEDGEMENT },
       {
         role: 'user',
-        content: `${languageInstruction(opts.language)}\n\nFocused autonomous repair.\nOriginal student request: ${opts.prompt}\n${requiredNewPaths.length ? `Required output path: ${requiredNewPaths.join(', ')}\n` : ''}The current source below failed a REAL verification command. Fix the actual error or timeout with the simplest complete implementation. Emit the Write/Edit action first, with no tutorial and no partial snippets.\n\n${currentFiles.join('\n\n')}\n\nVerification failure:\n$ ${command}\n${output}`,
+        content: `${languageInstruction(opts.language)}\n\nFocused autonomous repair.\nOriginal student request: ${prompt}\n${requiredNewPaths.length ? `Required output path: ${requiredNewPaths.join(', ')}\n` : ''}The current source below failed a REAL verification command. Fix the actual error or timeout with the simplest complete implementation. Emit the Write/Edit action first, with no tutorial and no partial snippets.\n\n${currentFiles.join('\n\n')}\n\nVerification failure:\n$ ${command}\n${output}`,
       },
     ];
   };
 
   const recordChange = (change: FileChange) => {
     changeSerial++;
+    consecutiveNoopWrites = 0;
     changes.push({ path: change.path, patch: change.patch });
     opts.changeLog?.add({ path: change.path, patch: change.patch });
     unverified.push(change.path);
@@ -488,7 +564,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       files,
       unverified,
       undefined,
-      opts.prompt,
+      prompt,
     );
     if (!cmd) {
       // No verifier applies to these paths (e.g. docs) — they can never be
@@ -512,8 +588,24 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     lastVerifySerial = changeSerial;
     // Only a passing check clears the dirty set — a failed one stays due
     // so the stop-branch retries after the model's next fix attempt.
-    if (ok) unverified = [];
-    else await focusFailedRepair(cmd.command, output);
+    if (ok) {
+      unverified = [];
+      verifyFailSignatures.length = 0;
+    } else {
+      // Same command, same normalized error, three runs in a row — each
+      // "fix" changed bytes but not behavior. Further retries are
+      // information-free; stop honestly instead of burning the budget.
+      const signature = `${cmd.command}\n${normalizeVerifyOutput(output, opts.projectDir)}`;
+      verifyFailSignatures.push(signature);
+      if (
+        verifyFailSignatures.length >= 3 &&
+        verifyFailSignatures.slice(-3).every((s) => s === signature)
+      ) {
+        stuckOnIdenticalError = true;
+        return true;
+      }
+      await focusFailedRepair(cmd.command, output);
+    }
     const guidance = ok
       ? 'Verification passed. If the request is complete, briefly summarize what you changed — do not repeat file contents.'
       : `This verification command failed. Use the REAL error output above and apply a source fix now — do not merely explain it, do not weaken tests, and do not send partial snippets.${requiredNewPaths.length ? ` Replace the required ${requiredNewPaths.join(', ')} with a complete minimal implementation when a whole-file rewrite is needed.` : ''} The check will run again only after a file changes.`;
@@ -548,10 +640,10 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     // The code-block fallback is the primary write path for ChatMinerva —
     // the model proposes whole files in fences rather than emitting tool
     // blocks. Permission mode still gates whether the Write auto-applies.
-    const { toolCalls, text } = parseToolCalls(response, {
+    const { toolCalls, text, suspectTruncated } = parseToolCalls(response, {
       codeBlockWriteFallback: true,
       knownFiles: projectFiles,
-      preferredFiles: requestExpectsChanges(opts.prompt)
+      preferredFiles: requestExpectsChanges(prompt)
         ? requiredNewPaths.length
           ? requiredNewPaths
           : repoMap.contextFiles.filter((file) => !TEST_FILE_PATH.test(file))
@@ -561,7 +653,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       guessPreferredFile: !auto,
       // "Write me a script …" against an empty project: default to main.py
       // (& co.) so the first reply's code is applied instead of dropped.
-      fallbackNewFile: requestExpectsChanges(opts.prompt),
+      fallbackNewFile: requestExpectsChanges(prompt),
       knownTools: tools.map((t) => t.name),
     });
     if (text) {
@@ -585,13 +677,31 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
           UI_CLAIM.test(response) ||
           // Refusals and fence-less code only warrant a retry when the
           // request actually asked for a change.
-          (requestExpectsChanges(opts.prompt) &&
+          (requestExpectsChanges(prompt) &&
             (CAPABILITY_REFUSAL.test(response) || UNFENCED_CODE.test(response))))
       ) {
         nudged = true;
         messages.push({
           role: 'user',
           content: formatNudge(projectFiles, requiredNewPaths),
+        });
+        continue;
+      }
+
+      // The model stalls with a question ("Would you like me to add
+      // that?") on a request that plainly asked for a change. Answer it
+      // deterministically once — the observed alternative is a dead loop
+      // of offers the student keeps approving to no effect.
+      if (
+        !questionNudged &&
+        !changes.length &&
+        requestExpectsChanges(prompt) &&
+        isQuestionOnlyReply(response)
+      ) {
+        questionNudged = true;
+        messages.push({
+          role: 'user',
+          content: `Yes. Do not ask further questions — proceed with your best interpretation now. Emit the complete file: the filename on its own line, then one fenced code block with the COMPLETE contents.\nOriginal request: ${prompt}`,
         });
         continue;
       }
@@ -605,7 +715,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
             { role: 'assistant', content: AGENT_ACKNOWLEDGEMENT },
             {
               role: 'user',
-              content: `${languageInstruction(opts.language)}\n\nAutonomous action required. The student explicitly asked you to CREATE ${missingRequiredPaths.join(', ')}, so creating ${missingRequiredPaths.length === 1 ? 'this new file is' : 'these new files is'} allowed. Emit the complete Write action now; do not refuse, explain, ask questions, mention unrelated files, or substitute another path.\nOriginal request: ${opts.prompt}${requestedCProgram ? '\nKeep the standalone C/C++ program under 80 lines with conventional headers, consistent lowercase loop identifiers, simple terminating loops, and no pointer tricks.' : ''}`,
+              content: `${languageInstruction(opts.language)}\n\nAutonomous action required. The student explicitly asked you to CREATE ${missingRequiredPaths.join(', ')}, so creating ${missingRequiredPaths.length === 1 ? 'this new file is' : 'these new files is'} allowed. Emit the complete Write action now; do not refuse, explain, ask questions, mention unrelated files, or substitute another path.\nOriginal request: ${prompt}${requestedCProgram ? '\nKeep the standalone C/C++ program under 80 lines with conventional headers, consistent lowercase loop identifiers, simple terminating loops, and no pointer tricks.' : ''}`,
             },
           ];
           continue;
@@ -692,6 +802,13 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       // Changes still unverified when the model stopped — verify them now.
       const pending: string[] = [];
       if (await harnessVerify(pending)) {
+        if (stuckOnIdenticalError) {
+          status = 'requirements-unmet';
+          opts.events.onStatus?.(
+            '⚠ Verification failed with the identical error 3 times — stopping. The last error output is shown above.',
+          );
+          break;
+        }
         messages.push({ role: 'user', content: pending.join('\n\n') });
         continue;
       }
@@ -717,7 +834,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
           const review = await runReview(client, {
             diff,
             language: opts.language,
-            intent: opts.prompt,
+            intent: prompt,
             signal: opts.signal,
           });
           opts.events.onText(`Code review (advisory):\n${review.raw}`);
@@ -740,6 +857,12 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     const assistedCodeblockOnly =
       !auto && toolCalls.every((c) => c.source === 'codeblock');
 
+    // The auto-closed final fence may hold half a file: its Write is the
+    // one produced from that fence (the last code-block Write).
+    const truncatedCall = suspectTruncated
+      ? [...toolCalls].reverse().find((c) => c.source === 'codeblock' && c.tool === 'Write')
+      : undefined;
+
     for (const call of toolCalls.slice(0, MAX_CALLS_PER_TURN)) {
       if (opts.signal?.aborted) break;
 
@@ -758,6 +881,27 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       }
 
       const input = parsed.data as Record<string, unknown>;
+
+      if (call === truncatedCall) {
+        if (auto && truncationNudges < 1) {
+          truncationNudges++;
+          const refused = `Refused: your reply was cut off mid-file, so this Write to ${input.path} is likely incomplete. Resend the COMPLETE ${input.path} in one fenced code block, nothing after it.`;
+          opts.events.onToolEnd({
+            tool,
+            input,
+            summary: tool.summarize(input),
+            ok: false,
+            result: refused,
+          });
+          results.push(formatToolResult(tool.name, refused, false));
+          continue;
+        }
+        if (!auto) {
+          opts.events.onStatus?.(
+            `⚠ The reply looks cut off — the proposed ${input.path} may be incomplete.`,
+          );
+        }
+      }
 
       let normalizedInputPath =
         typeof input.path === 'string' ? input.path.replace(/^\.\//, '') : null;
@@ -801,7 +945,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         tool.name === 'Write' &&
         normalizedInputPath &&
         requiredNewPaths.includes(normalizedInputPath) &&
-        requestRequiresExecution(opts.prompt) &&
+        requestRequiresExecution(prompt) &&
         /\.(?:c|cc|cpp|cxx)$/i.test(normalizedInputPath) &&
         typeof input.content === 'string' &&
         !/\b(?:int|void)\s+main\s*\([^)]*\)\s*\{/s.test(input.content)
@@ -824,7 +968,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         typeof input.path === 'string' &&
         !knownProjectFiles.has(input.path.replace(/^\.\//, '')) &&
         projectHasSourceFiles &&
-        !requestAllowsNewFile(opts.prompt)
+        !requestAllowsNewFile(prompt)
       ) {
         const refused = `Refused: ${input.path} does not exist and this request did not ask to create files. Fix the relevant existing source files; do not invent unrelated files.`;
         opts.events.onToolEnd({
@@ -846,7 +990,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         (tool.name === 'Write' || tool.name === 'Edit') &&
         typeof input.path === 'string' &&
         TEST_FILE_PATH.test(input.path) &&
-        !requestAllowsTestEdit(opts.prompt, input.path)
+        !requestAllowsTestEdit(prompt, input.path)
       ) {
         const refused = `Refused: ${input.path} is a test file and the request did not ask to change tests. The existing tests define the expected behavior — fix the SOURCE files so they pass.`;
         opts.events.onToolEnd({
@@ -880,7 +1024,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
           // not authorize rewriting unmentioned existing ones — the model
           // often restates them with subtly broken bodies.
           const protectedNames = requiredDefs.length
-            ? protectedDefinitionNames(String(input.path), existing, opts.prompt)
+            ? protectedDefinitionNames(String(input.path), existing, prompt)
             : undefined;
           const merged = mergePartialWrite(
             String(input.path),
@@ -900,7 +1044,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         typeof input.path === 'string' &&
         typeof input.content === 'string' &&
         !createdThisRun &&
-        !ALLOWS_DEFINITION_REMOVAL.test(opts.prompt)
+        !ALLOWS_DEFINITION_REMOVAL.test(prompt)
       ) {
         try {
           const target = resolveInProject(opts.projectDir, input.path);
@@ -946,8 +1090,18 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
 
       opts.events.onToolStart(event);
       const { ok, result, change } = await executeCall(tool, input, opts);
-      opts.events.onToolEnd({ ...event, ok, result });
-      results.push(formatToolResult(tool.name, result, ok));
+
+      // A Write that re-sends the file's current bytes is the model spinning
+      // in place. Say so explicitly — the plain success text reads as
+      // progress and the observed result is an endless resend loop.
+      const noopWrite =
+        ok && !change && (tool.name === 'Write' || tool.name === 'Edit');
+      const reported = noopWrite
+        ? `No change: ${input.path} already contains exactly this content.${verifyState.last === false ? ' The last verification failure is therefore still unresolved — send a DIFFERENT implementation.' : ''}`
+        : result;
+      if (noopWrite) consecutiveNoopWrites++;
+      opts.events.onToolEnd({ ...event, ok, result: reported });
+      results.push(formatToolResult(tool.name, reported, ok && !noopWrite));
 
       if (change) {
         recordChange(change);
@@ -959,7 +1113,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         ok &&
         tool.name === 'Bash' &&
         VERIFYISH_COMMAND.test(String(input.command ?? '')) &&
-        !requestRequiresExecution(opts.prompt)
+        !requestRequiresExecution(prompt)
       ) {
         unverified = [];
         verifyState.last = true;
@@ -973,6 +1127,16 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     }
     if (opts.signal?.aborted) {
       status = 'aborted';
+      break;
+    }
+
+    // Three identical resends with no real change in between: more turns
+    // will not produce different bytes. Stop honestly.
+    if (consecutiveNoopWrites >= 3) {
+      opts.events.onStatus?.(
+        '⚠ The model re-sent content identical to the current files 3 times — stopping.',
+      );
+      if (verifyState.last === false) status = 'requirements-unmet';
       break;
     }
 
@@ -991,12 +1155,31 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
           opts.events.onStatus?.(
             `⚠ Syntax check failed for ${applied.join(', ')} — the applied file does not parse:\n${detail}`,
           );
+        } else {
+          // Syntax is fine — also flag NameError-class typos ("for I in
+          // nums" loading i) that py_compile can never see. Advisory only.
+          const nameCmd = undefinedNameCheckCommand(applied);
+          if (nameCmd) {
+            const nameCheck = await runVerification(nameCmd, opts.projectDir, opts.signal);
+            if (!nameCheck.ok && nameCheck.output.includes('possibly undefined')) {
+              opts.events.onStatus?.(
+                `⚠ Possibly undefined name — this usually crashes at runtime:\n${nameCheck.output.trim().split('\n').slice(0, 3).join('\n')}`,
+              );
+            }
+          }
         }
       }
       break;
     }
 
     await harnessVerify(results);
+    if (stuckOnIdenticalError) {
+      status = 'requirements-unmet';
+      opts.events.onStatus?.(
+        '⚠ Verification failed with the identical error 3 times — stopping. The last error output is shown above.',
+      );
+      break;
+    }
     messages.push({ role: 'user', content: results.join('\n\n') });
 
     if (turn === MAX_TURNS - 1) {
@@ -1017,7 +1200,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   const verified =
     unverified.length && verifyState.last !== null ? false : verifyState.last;
 
-  if (status === 'completed' && requestExpectsChanges(opts.prompt) && changes.length === 0) {
+  if (status === 'completed' && requestExpectsChanges(prompt) && changes.length === 0) {
     status = 'no-change';
     opts.events.onStatus?.('⚠ The request expected a file change, but no applicable change was produced.');
   }
@@ -1034,5 +1217,10 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     verified,
     verification: verifyState.evidence,
     netChanges,
+    // Unfulfilled change-expecting request: the next bare "yes" resumes it.
+    pendingIntent:
+      requestExpectsChanges(prompt) && changes.length === 0 && status !== 'aborted'
+        ? prompt
+        : null,
   };
 }
