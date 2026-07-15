@@ -10,15 +10,7 @@ function formatDate(unixSeconds: number): string {
   });
 }
 
-function truncateEmail(email: string, max = 24): string {
-  if (email.length <= max) return email;
-  const [local, domain] = email.split('@');
-  if (!domain) return email.slice(0, max - 1) + '…';
-  const keep = max - domain.length - 2;
-  return `${local.slice(0, Math.max(keep, 3))}…@${domain}`;
-}
-
-export function printSessionInfo(info: SessionInfo): void {
+export function sessionInfoLines(info: SessionInfo): string[] {
   const { user, platform, model } = info;
   const modelName = model?.name ?? info.config.model;
   const caps = model?.info?.meta?.capabilities;
@@ -28,35 +20,39 @@ export function printSessionInfo(info: SessionInfo): void {
   if (caps?.web_search) capParts.push('web');
 
   const lines = [
-    `User:   ${user.name} (${truncateEmail(user.email)})`,
-    `Model:  ${modelName}`,
-    `API:    Open WebUI ${platform.version}`,
-    `Token:  valid until ${formatDate(user.expires_at)}`,
+    `model: ${modelName} · Open WebUI ${platform.version}`,
+    `${user.email} · token valid until ${formatDate(user.expires_at)}`,
   ];
   if (capParts.length) {
-    lines.push(`Caps:   ${capParts.join(', ')}`);
+    lines.push(`caps: ${capParts.join(', ')}`);
   }
+  return lines;
+}
 
-  const width = Math.max(...lines.map((l) => l.length)) + 4;
-  const border = '─'.repeat(width - 2);
+export const HELP_LINES = [
+  '/help    show this help',
+  '/info    show session info',
+  '/model   switch model',
+  '/clear   clear conversation history',
+  '/login   re-authenticate',
+  '/logout  clear saved credentials',
+  '/exit    quit',
+];
 
+export function printSessionInfo(info: SessionInfo): void {
   console.log('');
-  console.log(chalk.cyan(`  ╭─ Minerva CLI ${border.slice(13)}╮`));
-  for (const line of lines) {
-    const padded = line.padEnd(width - 4);
-    console.log(chalk.cyan(`  │ ${padded} │`));
+  console.log(`${chalk.hex('#d97757')('✻')} ${chalk.bold('Minerva CLI')}`);
+  console.log('');
+  for (const line of sessionInfoLines(info)) {
+    console.log(chalk.dim(`  ${line}`));
   }
-  console.log(chalk.cyan(`  ╰${border}╯`));
   console.log('');
 }
 
 export function printHelp(): void {
-  console.log(chalk.bold('\nCommands:'));
-  console.log('  /help    Show this help');
-  console.log('  /info    Show session info');
-  console.log('  /model   List or switch model');
-  console.log('  /clear   Clear conversation history');
-  console.log('  /login   Re-authenticate');
-  console.log('  /logout  Clear saved credentials');
-  console.log('  /exit    Quit\n');
+  console.log('');
+  for (const line of HELP_LINES) {
+    console.log(chalk.dim(`  ${line}`));
+  }
+  console.log('');
 }

@@ -17,13 +17,16 @@
   "dependencies": {
     "@inquirer/prompts": "^7.5.0",
     "chalk": "^5.4.1",
-    "commander": "^13.1.0"
+    "commander": "^13.1.0",
+    "ink": "^7.1.0",
+    "react": "^19.2.7"
   },
   "optionalDependencies": {
     "playwright": "^1.52.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
+    "@types/react": "^19.2.17",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"
   }

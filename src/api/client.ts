@@ -63,11 +63,12 @@ export class MinervaClient {
     return res.json() as Promise<T>;
   }
 
-  async postStream(path: string, body: unknown): Promise<Response> {
+  async postStream(path: string, body: unknown, signal?: AbortSignal): Promise<Response> {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify(body),
+      signal,
     });
     if (!res.ok) {
       const text = await res.text();

@@ -9,7 +9,6 @@ export interface BrowserLoginOptions {
   password?: string;
   baseUrl?: string;
   headless?: boolean;
-  browserOnly?: boolean;
 }
 
 type PlaywrightModule = typeof import('playwright');
@@ -22,91 +21,91 @@ async function loadPlaywright(): Promise<PlaywrightModule | null> {
   }
 }
 
-async function launchBrowser(
+async function playwrightAutoLogin(
   pw: PlaywrightModule,
-  headless: boolean,
-): Promise<Awaited<ReturnType<PlaywrightModule['chromium']['launch']>>> {
-  const channels = ['chrome', 'msedge'] as const;
+  options: Required<Pick<BrowserLoginOptions, 'email' | 'password'>> & BrowserLoginOptions,
+): Promise<MinervaConfig> {
+  const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+
+  // Try system Chrome first (best reCAPTCHA compatibility), then Edge, then bundled Chromium
+  const channels = ['chrome', 'msedge', null] as const;
+  let lastError: Error | null = null;
 
   for (const channel of channels) {
     try {
-      return await pw.chromium.launch({ channel, headless });
-    } catch {
-      // try next channel
+      const launchOpts = channel
+        ? { channel, headless: options.headless ?? false }
+        : { headless: options.headless ?? false };
+
+      const browser = await pw.chromium.launch(launchOpts);
+      const page = await browser.newPage();
+
+      try {
+        await page.goto(`${baseUrl}/auth`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+
+        const acceptBtn = page.getByRole('button', { name: 'Accept and continue' });
+        if (await acceptBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+          await acceptBtn.click();
+          await page.waitForTimeout(500);
+        }
+
+        await page.getByRole('textbox', { name: 'Email' }).waitFor({ timeout: 15000 });
+        await page.getByRole('textbox', { name: 'Email' }).fill(options.email);
+        await page.getByRole('textbox', { name: /Password/i }).fill(options.password);
+        await page.getByRole('button', { name: 'Sign in' }).click();
+
+        await page.waitForURL((url) => !url.pathname.includes('/auth'), { timeout: 60000 });
+
+        const token = await page.evaluate(() => localStorage.getItem('token'));
+        if (!token) throw new Error('Login succeeded but no token in localStorage');
+
+        const tempConfig = createConfigFromAuth(token, options.email, 0, DEFAULT_MODEL, baseUrl);
+        const client = new MinervaClient(tempConfig);
+        const profile = await getAuthProfile(client);
+
+        return createConfigFromAuth(
+          profile.token,
+          profile.email,
+          profile.expires_at,
+          DEFAULT_MODEL,
+          baseUrl,
+        );
+      } finally {
+        await browser.close();
+      }
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
     }
   }
 
-  return pw.chromium.launch({ headless });
-}
-
-async function playwrightAutoLogin(options: BrowserLoginOptions): Promise<MinervaConfig> {
-  const pw = await loadPlaywright();
-  if (!pw) {
-    throw new Error('Playwright is not installed');
-  }
-
-  if (!options.email || !options.password) {
-    throw new Error('Email and password required for automated login');
-  }
-
-  const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
-  const browser = await launchBrowser(pw, options.headless ?? false);
-  const page = await browser.newPage();
-
-  try {
-    await page.goto(`${baseUrl}/auth`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-
-    const acceptBtn = page.getByRole('button', { name: 'Accept and continue' });
-    if (await acceptBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await acceptBtn.click();
-      await page.waitForTimeout(500);
-    }
-
-    await page.getByRole('textbox', { name: 'Email' }).waitFor({ timeout: 15000 });
-    await page.getByRole('textbox', { name: 'Email' }).fill(options.email);
-    await page.getByRole('textbox', { name: /Password/i }).fill(options.password);
-    await page.getByRole('button', { name: 'Sign in' }).click();
-
-    await page.waitForURL((url) => !url.pathname.includes('/auth'), { timeout: 60000 });
-
-    const token = await page.evaluate(() => localStorage.getItem('token'));
-    if (!token) {
-      throw new Error('Login succeeded but no token found in localStorage');
-    }
-
-    const tempConfig = createConfigFromAuth(token, options.email, 0, DEFAULT_MODEL, baseUrl);
-    const client = new MinervaClient(tempConfig);
-    const profile = await getAuthProfile(client);
-
-    return createConfigFromAuth(
-      profile.token,
-      profile.email,
-      profile.expires_at,
-      DEFAULT_MODEL,
-      baseUrl,
-    );
-  } finally {
-    await browser.close();
-  }
+  throw lastError ?? new Error('All browser launch attempts failed');
 }
 
 export async function browserLogin(options: BrowserLoginOptions = {}): Promise<MinervaConfig> {
   const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
 
-  if (options.browserOnly) {
+  if (!options.email || !options.password) {
     return manualBrowserLogin(baseUrl);
   }
 
-  if (options.email && options.password) {
-    try {
-      return await playwrightAutoLogin(options);
-    } catch {
-      // fall through to system browser
-    }
+  const pw = await loadPlaywright();
+  if (!pw) {
+    // Playwright not installed — open system browser and ask user to paste token
+    return manualBrowserLogin(baseUrl);
   }
 
-  return manualBrowserLogin(baseUrl);
+  try {
+    return await playwrightAutoLogin(pw, {
+      email: options.email,
+      password: options.password,
+      baseUrl,
+      headless: options.headless,
+    });
+  } catch {
+    // Chrome/Playwright failed — fall back to system browser
+    return manualBrowserLogin(baseUrl);
+  }
 }
 
 export async function loginWithToken(

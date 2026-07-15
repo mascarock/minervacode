@@ -31,25 +31,15 @@ node dist/index.js   # same, after build
 
 ### Login
 
-**Default** — opens Chat Minerva in your system browser (Chrome, Safari, etc.), then you paste the token:
-
 ```bash
 minervacli login
 ```
 
-Steps:
-1. Your browser opens to `chatminerva.org/auth`
-2. Sign in normally (reCAPTCHA works in your real browser)
-3. Open DevTools → Application → Local Storage → copy `token`
-4. Paste it in the terminal
+You'll be prompted for your email and password. A Chrome window opens automatically, handles reCAPTCHA, signs you in, and saves the token — you don't need to touch the browser.
 
-**Optional automated login** (requires Google Chrome + Playwright):
+**If Chrome is not available**, it falls back to opening your default browser and asking you to paste the token manually.
 
-```bash
-minervacli login --email you@example.com --password yourpassword
-```
-
-**Or paste a token directly:**
+**Or paste a token directly** (skip the browser entirely):
 
 ```bash
 minervacli login --token <your-jwt>
