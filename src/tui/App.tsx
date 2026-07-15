@@ -1,54 +1,81 @@
 import { useRef, useState } from 'react';
 import { Box, Text, useApp, useInput } from 'ink';
 import type { MinervaClient } from '../api/client.js';
-import { streamChat } from '../api/chat.js';
 import { listModels } from '../api/models.js';
 import { saveConfig } from '../auth/store.js';
 import { gatherSessionInfo } from '../session.js';
 import type { ChatMessage, MinervaConfig, ModelInfo, SessionInfo } from '../types.js';
 import { HELP_LINES, sessionInfoLines } from '../ui/info.js';
+import { runAgent } from '../agent/loop.js';
+import { ChangeLog } from '../agent/context.js';
+import type { PermissionMode } from '../agent/permissions.js';
+import { getTools } from '../tools/registry.js';
 import { Transcript, type Entry } from './Transcript.js';
 import { InputBox } from './InputBox.js';
 import { Spinner } from './Spinner.js';
 import { ModelPicker } from './ModelPicker.js';
+import { ApprovalPrompt, type ApprovalRequest } from './ApprovalPrompt.js';
 
 export type ReplAction = 'exit' | 'login' | 'logout';
 
-type Phase = 'idle' | 'waiting' | 'streaming' | 'picking-model';
+type Phase = 'idle' | 'waiting' | 'tooling' | 'approving' | 'picking-model';
 
 type NewEntry =
   | { kind: 'user'; text: string }
-  | { kind: 'assistant'; text: string; interrupted?: boolean }
+  | { kind: 'assistant'; text: string }
   | { kind: 'system'; text: string }
-  | { kind: 'error'; text: string };
+  | { kind: 'error'; text: string }
+  | { kind: 'tool'; name: string; summary: string; ok: boolean }
+  | { kind: 'diff'; patch: string };
+
+export interface AgentSettings {
+  projectDir: string;
+  auto: boolean;
+  /** Explicit --permission-mode; when unset it follows the auto toggle. */
+  permissionMode?: PermissionMode;
+}
 
 interface AppProps {
   client: MinervaClient;
   config: MinervaConfig;
   sessionInfo: SessionInfo;
+  agent: AgentSettings;
   onAction: (action: ReplAction) => void;
 }
 
-export function App({ client, config: initialConfig, sessionInfo, onAction }: AppProps) {
+export function App({ client, config: initialConfig, sessionInfo, agent, onAction }: AppProps) {
   const { exit } = useApp();
+  const [auto, setAuto] = useState(agent.auto);
   const [entries, setEntries] = useState<Entry[]>([
-    { id: 0, kind: 'welcome', info: sessionInfo },
+    {
+      id: 0,
+      kind: 'welcome',
+      info: sessionInfo,
+      extra: [
+        `agent: ${agent.auto ? 'auto' : 'assisted'} · dir: ${agent.projectDir}`,
+      ],
+    },
   ]);
   const [phase, setPhase] = useState<Phase>('idle');
-  const [streamText, setStreamText] = useState('');
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [config, setConfig] = useState(initialConfig);
   const [waitStart, setWaitStart] = useState(0);
+  const [liveTool, setLiveTool] = useState('');
+  const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
   const abortRef = useRef<AbortController | null>(null);
+  const changeLogRef = useRef(new ChangeLog());
   const nextId = useRef(1);
 
   const push = (entry: NewEntry) => {
     setEntries((prev) => [...prev, { ...entry, id: nextId.current++ }]);
   };
 
+  const permissionMode = (): PermissionMode =>
+    agent.permissionMode ?? (auto ? 'acceptEdits' : 'default');
+
   useInput((_input, key) => {
-    if (key.escape && (phase === 'waiting' || phase === 'streaming')) {
+    if (key.escape && (phase === 'waiting' || phase === 'tooling')) {
       abortRef.current?.abort();
     }
   });
@@ -66,33 +93,61 @@ export function App({ client, config: initialConfig, sessionInfo, onAction }: Ap
     abortRef.current = controller;
 
     try {
-      const reply = await streamChat(
-        client,
-        [...messagesRef.current, { role: 'user', content: text }],
-        {
-          signal: controller.signal,
-          onChunk: (chunk) => {
-            setPhase('streaming');
-            setStreamText((prev) => prev + chunk);
+      const result = await runAgent(client, {
+        history: messagesRef.current,
+        prompt: text,
+        projectDir: agent.projectDir,
+        permissionMode: permissionMode(),
+        assisted: !auto,
+        signal: controller.signal,
+        changeLog: changeLogRef.current,
+        events: {
+          onText: (t) => {
+            push({ kind: 'assistant', text: t });
+            setPhase('waiting');
+            setWaitStart(Date.now());
           },
+          onToolStart: (e) => {
+            setLiveTool(`[${e.tool.name}] ${e.summary}`);
+            setPhase('tooling');
+          },
+          onToolEnd: (e) => {
+            setLiveTool('');
+            push({ kind: 'tool', name: e.tool.name, summary: e.summary, ok: e.ok });
+            setPhase('waiting');
+            setWaitStart(Date.now());
+          },
+          confirm: (e) =>
+            new Promise<boolean>((resolve) => {
+              setApproval({
+                name: e.tool.name,
+                summary: e.summary,
+                preview: e.preview,
+                resolve: (approved) => {
+                  setApproval(null);
+                  setPhase('waiting');
+                  setWaitStart(Date.now());
+                  resolve(approved);
+                },
+              });
+              setPhase('approving');
+            }),
         },
-      );
-      messagesRef.current.push({ role: 'user', content: text });
-      if (reply) {
-        messagesRef.current.push({ role: 'assistant', content: reply });
-      }
-      push({ kind: 'assistant', text: reply, interrupted: controller.signal.aborted });
+      });
+      messagesRef.current = result.history;
     } catch (err) {
       push({ kind: 'error', text: err instanceof Error ? err.message : String(err) });
     } finally {
       abortRef.current = null;
-      setStreamText('');
+      setApproval(null);
+      setLiveTool('');
       setPhase('idle');
     }
   };
 
   const handleCommand = async (line: string) => {
-    const cmd = line.toLowerCase();
+    const [cmd, ...rest] = line.toLowerCase().split(/\s+/);
+    const arg = rest.join(' ');
 
     if (cmd === '/exit' || cmd === '/quit') return finish('exit');
     if (cmd === '/logout') return finish('logout');
@@ -107,6 +162,36 @@ export function App({ client, config: initialConfig, sessionInfo, onAction }: Ap
     if (cmd === '/info') {
       const info = await gatherSessionInfo(client, config);
       return push({ kind: 'system', text: sessionInfoLines(info).join('\n') });
+    }
+
+    if (cmd === '/auto') {
+      const next = arg === 'on' ? true : arg === 'off' ? false : !auto;
+      setAuto(next);
+      return push({
+        kind: 'system',
+        text: next
+          ? 'Auto mode on — edits apply without asking, bash still asks.'
+          : 'Assisted mode — every change needs your approval.',
+      });
+    }
+
+    if (cmd === '/tools') {
+      const lines = getTools().map(
+        (t) => `${t.name}${t.isReadOnly() ? '' : ' *'}  ${t.description}`,
+      );
+      return push({
+        kind: 'system',
+        text: `${lines.join('\n')}\n* requires approval depending on mode`,
+      });
+    }
+
+    if (cmd === '/diff') {
+      const changes = changeLogRef.current.all();
+      if (!changes.length) return push({ kind: 'system', text: 'No changes this session.' });
+      for (const change of changes) {
+        push({ kind: 'diff', patch: change.patch });
+      }
+      return;
     }
 
     if (cmd === '/model') {
@@ -150,21 +235,12 @@ export function App({ client, config: initialConfig, sessionInfo, onAction }: Ap
           <Spinner startedAt={waitStart} />
         </Box>
       ) : null}
-      {phase === 'streaming' ? (
-        <Box flexDirection="column" marginBottom={1}>
-          <Box>
-            <Box marginRight={1}>
-              <Text>●</Text>
-            </Box>
-            <Box flexGrow={1}>
-              <Text>{streamText}</Text>
-            </Box>
-          </Box>
-          <Box marginLeft={2}>
-            <Text dimColor>esc to interrupt</Text>
-          </Box>
+      {phase === 'tooling' ? (
+        <Box marginBottom={1} marginLeft={2}>
+          <Text dimColor>{liveTool} …</Text>
         </Box>
       ) : null}
+      {phase === 'approving' && approval ? <ApprovalPrompt request={approval} /> : null}
       {phase === 'picking-model' ? (
         <ModelPicker
           models={models}

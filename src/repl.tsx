@@ -1,9 +1,10 @@
 import chalk from 'chalk';
 import { render } from 'ink';
 import { MinervaClient } from './api/client.js';
-import type { MinervaConfig, ChatMessage } from './types.js';
-import { streamChat } from './api/chat.js';
+import type { MinervaConfig } from './types.js';
 import { validateSession } from './api/auth.js';
+import { runAgent } from './agent/loop.js';
+import { consoleAgentEvents } from './ui/agent-console.js';
 import { browserLogin, loginWithToken } from './auth/browser-login.js';
 import {
   loadConfig,
@@ -13,8 +14,7 @@ import {
 } from './auth/store.js';
 import { gatherSessionInfo } from './session.js';
 import { printSessionInfo } from './ui/info.js';
-import { BulletStreamWriter } from './ui/stream.js';
-import { App, type ReplAction } from './tui/App.js';
+import { App, type AgentSettings, type ReplAction } from './tui/App.js';
 
 async function ensureConfig(): Promise<MinervaConfig> {
   let config = await loadConfig();
@@ -75,20 +75,19 @@ export async function runInfo(client: MinervaClient, config: MinervaConfig): Pro
 export async function runChatOnce(
   client: MinervaClient,
   prompt: string,
-  messages: ChatMessage[] = [],
-): Promise<string> {
-  const history = [...messages, { role: 'user' as const, content: prompt }];
-  console.log('');
-  const writer = new BulletStreamWriter();
-  const reply = await streamChat(client, history, {
-    onChunk: (chunk) => writer.write(chunk),
+  agent: AgentSettings,
+): Promise<void> {
+  await runAgent(client, {
+    history: [],
+    prompt,
+    projectDir: agent.projectDir,
+    permissionMode: agent.permissionMode ?? (agent.auto ? 'acceptEdits' : 'default'),
+    assisted: !agent.auto,
+    events: consoleAgentEvents(),
   });
-  writer.end();
-  console.log('');
-  return reply;
 }
 
-export async function runRepl(initialConfig?: MinervaConfig): Promise<void> {
+export async function runRepl(agent: AgentSettings, initialConfig?: MinervaConfig): Promise<void> {
   let config = initialConfig ?? (await ensureConfig());
 
   while (true) {
@@ -101,6 +100,7 @@ export async function runRepl(initialConfig?: MinervaConfig): Promise<void> {
         client={client}
         config={config}
         sessionInfo={sessionInfo}
+        agent={agent}
         onAction={(a) => {
           action = a;
         }}

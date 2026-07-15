@@ -1,27 +1,75 @@
 #!/usr/bin/env node
-import { Command } from 'commander';
+import { writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { Command, InvalidArgumentError } from 'commander';
 import chalk from 'chalk';
 import { MinervaClient } from './api/client.js';
 import { clearConfig } from './auth/store.js';
 import { runRepl, runInfo, runChatOnce, runLoginFlow, ensureConfig } from './repl.js';
+import { PERMISSION_MODES, type PermissionMode } from './agent/permissions.js';
+import { PROJECT_CONTEXT_FILE, PROJECT_CONTEXT_TEMPLATE } from './agent/prompts.js';
+import type { AgentSettings } from './tui/App.js';
 
 const program = new Command();
 
+function parsePermissionMode(value: string): PermissionMode {
+  if (!PERMISSION_MODES.includes(value as PermissionMode)) {
+    throw new InvalidArgumentError(`Must be one of: ${PERMISSION_MODES.join(', ')}`);
+  }
+  return value as PermissionMode;
+}
+
+interface MainOptions {
+  auto?: boolean;
+  projectDir: string;
+  permissionMode?: PermissionMode;
+  init?: boolean;
+  headless?: boolean;
+}
+
+function agentSettings(opts: MainOptions): AgentSettings {
+  return {
+    projectDir: path.resolve(opts.projectDir),
+    auto: opts.auto ?? false,
+    permissionMode: opts.permissionMode,
+  };
+}
+
+async function scaffoldProjectContext(projectDir: string): Promise<void> {
+  const file = path.join(path.resolve(projectDir), PROJECT_CONTEXT_FILE);
+  if (existsSync(file)) {
+    console.log(chalk.yellow(`${file} already exists — not overwriting.`));
+    return;
+  }
+  await writeFile(file, PROJECT_CONTEXT_TEMPLATE, 'utf-8');
+  console.log(chalk.dim(`Created ${file} — describe your project there.`));
+}
+
 program
   .name('minervacli')
-  .description('Terminal chat client for Chat Minerva')
+  .description('Terminal chat client and coding agent for Chat Minerva')
   .version('0.1.0')
   .argument('[prompt]', 'Send a one-shot message and exit')
+  .option('--auto', 'Full autonomous agent (default: assisted, approve each change)')
+  .option('--project-dir <dir>', 'Project root the agent works in', process.cwd())
+  .option('--permission-mode <mode>', 'default | acceptEdits | dontAsk', parsePermissionMode)
+  .option('--init', `Scaffold a ${PROJECT_CONTEXT_FILE} project context file and exit`)
   .option('--headless', 'Run browser login headless')
-  .action(async (prompt: string | undefined, opts: { headless?: boolean }) => {
+  .action(async (prompt: string | undefined, opts: MainOptions) => {
     try {
+      if (opts.init) {
+        await scaffoldProjectContext(opts.projectDir);
+        return;
+      }
+      const agent = agentSettings(opts);
       if (prompt) {
         const config = await ensureConfig();
         const client = new MinervaClient(config);
-        await runChatOnce(client, prompt);
+        await runChatOnce(client, prompt, agent);
         return;
       }
-      await runRepl();
+      await runRepl(agent);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`Error: ${msg}`));

@@ -4,22 +4,22 @@ overview: "Extend minervacli from a chat REPL into a dual-mode coding agent for 
 todos:
   - id: tool-interface
     content: "Create Tool interface, registry, and 6 tools: Read, Write, Edit, Bash, Grep, Glob"
-    status: pending
+    status: completed
   - id: agent-parser
     content: Build parser.ts (XML/JSON/code-block) and prompts.ts with Italian student system prompt
-    status: pending
+    status: completed
   - id: agent-loop
     content: Implement agent/loop.ts turn loop with MAX_TURNS and tool result feedback
-    status: pending
+    status: completed
   - id: permissions
     content: Add permissions.ts + assisted preview (diff for edits, y/n prompts)
-    status: pending
+    status: completed
   - id: cli-flags
     content: Wire --auto, --project-dir, --permission-mode into index.ts and REPL /auto toggle
-    status: pending
+    status: completed
   - id: student-polish
     content: Tool call indicators in terminal, .minervacli.md project context, README update
-    status: pending
+    status: completed
 isProject: false
 ---
 
