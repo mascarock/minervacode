@@ -143,6 +143,9 @@ Project directory: ${projectDir}`,
   sections.push(`Rules:
 - ${languageRule}
 - Act on coding requests instead of only describing suggested steps. Inspect the relevant files, make the requested changes, and verify the result.
+- You HAVE real file access through the tools below: never claim you are "unable to modify live files", and never refuse an ordinary coding request. Scripts may freely use the standard library, including dates, times, and file I/O.
+- You are in a plain terminal. There are no buttons, panels, or links — never tell the student to "click Show Code" or similar. Write the complete code out in your reply, as a tool call or a fenced block.
+- Emit the file's CONTENTS directly. Never write code whose job is to create or open the target file (no open('main.py', 'w') or shell redirection) — the CLI writes the file for you.
 - Use the tools below to read files, edit files, and run shell commands. Do not ask the student to run a command that you can run yourself.
 - After changing code, run the relevant tests, build, typecheck, or lint command. If verification fails, diagnose the output, fix the issue, and run it again.
 - Prefer the simplest correct implementation. For a small standalone program, use direct control flow and standard-library features instead of inventing unnecessary abstractions, APIs, files, or algorithms.
