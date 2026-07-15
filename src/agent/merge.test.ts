@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { mergePartialWrite, removedTopLevelDefinitions } from './merge.js';
+import {
+  mergePartialWrite,
+  protectedDefinitionNames,
+  removedTopLevelDefinitions,
+} from './merge.js';
 
 const EXISTING = `import math
 
@@ -67,9 +71,37 @@ def maximum(numbers):
     expect(merged).toContain('return 2');
   });
 
-  it('returns null when nothing overlaps with the existing file', () => {
+  it('appends a definitions-only proposal that overlaps nothing', () => {
     const proposed = `def minimum(numbers):
     return min(numbers)
+`;
+    const merged = mergePartialWrite('calc.py', EXISTING, proposed);
+    expect(merged).toContain('def minimum');
+    expect(merged).toContain('def average');
+    expect(merged).toContain('def maximum');
+    expect(merged).toContain('print(average([1, 2]))');
+  });
+
+  it('keeps the existing body of protected definitions and appends the new one', () => {
+    const existing = 'def double(n):\n    return n * 2\n';
+    const proposed =
+      'def double(n):\n    return n % 2 == 0\n\n\ndef is_even(n):\n    return n % 2 == 0\n';
+    const merged = mergePartialWrite(
+      'utils.py',
+      existing,
+      proposed,
+      new Set(['double']),
+    );
+    expect(merged).toContain('return n * 2');
+    expect(merged).not.toContain('def double(n):\n    return n % 2 == 0');
+    expect(merged).toContain('def is_even');
+  });
+
+  it('still returns null when a non-overlapping proposal has loose statements', () => {
+    const proposed = `def minimum(numbers):
+    return min(numbers)
+
+print(minimum([3, 1]))
 `;
     expect(mergePartialWrite('calc.py', EXISTING, proposed)).toBeNull();
   });
@@ -157,6 +189,18 @@ def average(numbers):
     expect(merged).toContain('import statistics');
     expect(merged).not.toContain('debug!');
     expect(merged).not.toContain('CONSTANT = 42');
+  });
+});
+
+describe('protectedDefinitionNames', () => {
+  it('protects definitions the request never mentions', () => {
+    const existing = 'def double(n):\n    return n * 2\n\ndef half(n):\n    return n / 2\n';
+    expect(
+      protectedDefinitionNames('utils.py', existing, 'Add a function is_even(n) to utils.py.'),
+    ).toEqual(new Set(['double', 'half']));
+    expect(
+      protectedDefinitionNames('utils.py', existing, 'Fix double(n) and add is_even(n).'),
+    ).toEqual(new Set(['half']));
   });
 });
 

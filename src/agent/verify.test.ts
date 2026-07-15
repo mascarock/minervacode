@@ -125,9 +125,47 @@ describe('detectVerifyCommand', () => {
     expect(cmd?.command).toBe("python3 -m py_compile 'calc.py' && python3 -m unittest discover -q");
   });
 
-  it('syntax-checks function-style tests when pytest is missing', async () => {
+  it('runs function-style tests with the fallback driver when pytest is missing', async () => {
     const dir = await tempProject();
     await writeFile(path.join(dir, 'test_calc.py'), 'def test_x():\n    assert True\n');
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['calc.py', 'test_calc.py'],
+      ['calc.py'],
+      async () => false,
+    );
+    expect(cmd?.source).toBe('python test functions');
+    expect(cmd?.command).toContain('runpy.run_path');
+  });
+
+  it('fallback driver really fails on a failing assert and passes after the fix', async () => {
+    const dir = await tempProject();
+    await writeFile(path.join(dir, 'calc.py'), 'def add(a, b):\n    return a - b\n');
+    await writeFile(
+      path.join(dir, 'test_calc.py'),
+      'from calc import add\n\ndef test_add():\n    assert add(2, 3) == 5\n',
+    );
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['calc.py', 'test_calc.py'],
+      ['calc.py'],
+      async () => false,
+    );
+    expect(cmd).not.toBeNull();
+
+    const failing = await runVerification(cmd!, dir);
+    expect(failing.ok).toBe(false);
+    expect(failing.output).toContain('test_add FAILED');
+
+    await writeFile(path.join(dir, 'calc.py'), 'def add(a, b):\n    return a + b\n');
+    const passing = await runVerification(cmd!, dir);
+    expect(passing.ok).toBe(true);
+    expect(passing.output).toContain('test_add passed');
+  });
+
+  it('still syntax-checks when test files define no test functions', async () => {
+    const dir = await tempProject();
+    await writeFile(path.join(dir, 'test_calc.py'), 'HELPERS = []\n');
     const cmd = await detectVerifyCommand(
       dir,
       ['calc.py', 'test_calc.py'],
@@ -140,11 +178,68 @@ describe('detectVerifyCommand', () => {
     });
   });
 
-  it('falls back to a syntax check of changed python files', async () => {
+  it('smoke-runs a single changed python file with dummy piped input', async () => {
     const dir = await tempProject();
     const cmd = await detectVerifyCommand(dir, ['calc.py'], ['calc.py']);
     expect(cmd).toEqual({
-      command: "python3 -m py_compile 'calc.py'",
+      command: "python3 -m py_compile 'calc.py' && yes 2 | head -50 | python3 'calc.py'",
+      source: 'compile and run',
+      timeoutMs: 10_000,
+      expectOutput: false,
+    });
+  });
+
+  it('expects printed output when the request asks for printing', async () => {
+    const dir = await tempProject();
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['countdown.py'],
+      ['countdown.py'],
+      undefined,
+      'Make a script countdown.py that counts down from 10 to 1 printing each number.',
+    );
+    expect(cmd?.expectOutput).toBe(true);
+
+    const quiet = await detectVerifyCommand(
+      dir,
+      ['utils.py'],
+      ['utils.py'],
+      undefined,
+      'Add a function is_even(n) to utils.py that returns True for even numbers.',
+    );
+    expect(quiet?.expectOutput).toBe(false);
+  });
+
+  it('fails a print-task program that runs but prints nothing', async () => {
+    const dir = await tempProject();
+    await writeFile(
+      path.join(dir, 'countdown.py'),
+      'def main():\n    print("10")\n\n# main() never called\n',
+    );
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['countdown.py'],
+      ['countdown.py'],
+      undefined,
+      'Make a script that counts down printing each number.',
+    );
+    const result = await runVerification(cmd!, dir);
+    expect(result.ok).toBe(false);
+    expect(result.output).toContain('printed NOTHING');
+
+    await writeFile(
+      path.join(dir, 'countdown.py'),
+      'def main():\n    print("10")\n\nmain()\n',
+    );
+    const fixed = await runVerification(cmd!, dir);
+    expect(fixed.ok).toBe(true);
+  });
+
+  it('falls back to a syntax check when several python files changed', async () => {
+    const dir = await tempProject();
+    const cmd = await detectVerifyCommand(dir, ['calc.py', 'utils.py'], ['calc.py', 'utils.py']);
+    expect(cmd).toEqual({
+      command: "python3 -m py_compile 'calc.py' 'utils.py'",
       source: 'syntax check',
     });
   });

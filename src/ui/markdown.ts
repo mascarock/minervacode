@@ -30,6 +30,13 @@ export function unwrapMarkdownWrapper(text: string): string {
   const lines = text.split('\n');
   const first = lines.findIndex((line) => line.trim());
   if (first === -1 || !/^```(?:markdown|md)\s*$/i.test(lines[first].trim())) return text;
+  // A wrapper is only a wrapper when other fences nest inside it. A single
+  // plain ```markdown block is left intact so the code-block Write fallback
+  // can still inspect it (its contents are often mislabelled code).
+  const nestedFences = lines
+    .slice(first + 1)
+    .filter((line) => line.trimStart().startsWith('```')).length;
+  if (nestedFences <= 1) return text;
   lines.splice(first, 1);
   const fences = lines.filter((line) => line.trimStart().startsWith('```')).length;
   if (fences % 2 === 1) {
@@ -236,6 +243,28 @@ function blockAnsi(block: MarkdownBlock): string {
     case 'paragraph':
       return segmentsAnsi(block.segments);
   }
+}
+
+export interface CodeBlock {
+  lang: string;
+  content: string;
+}
+
+/**
+ * The `back`-th most recent non-empty fenced code block across the given
+ * texts (1 = newest). Used by /copy so the student gets the raw code
+ * without the rendered gutter.
+ */
+export function latestCodeBlock(texts: string[], back = 1): CodeBlock | null {
+  const blocks: CodeBlock[] = [];
+  for (const text of texts) {
+    for (const block of parseMarkdown(text)) {
+      if (block.kind === 'code' && block.content.trim()) {
+        blocks.push({ lang: block.lang, content: block.content });
+      }
+    }
+  }
+  return blocks[blocks.length - back] ?? null;
 }
 
 /** Markdown → ANSI string, for the plain-stdout one-shot mode. */

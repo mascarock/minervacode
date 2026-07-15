@@ -27,6 +27,20 @@ export interface ParseOptions {
   knownFiles?: string[];
   /** Unique relevance-ranked source candidates for filename-less code fences. */
   preferredFiles?: string[];
+  /**
+   * Assisted-only: when several preferred files match a filename-less fence
+   * with a KNOWN language, propose the top relevance-ranked one instead of
+   * giving up — the student approves or denies every proposed Write, so a
+   * wrong guess costs one keypress while no guess dead-ends the request.
+   */
+  guessPreferredFile?: boolean;
+  /**
+   * When a filename-less fence has a KNOWN language and the project contains
+   * no file of that language, target a conventional new file (main.py,
+   * main.c, …). Without this, the model's first — often best — reply is
+   * dropped in an empty project and the retry is usually worse.
+   */
+  fallbackNewFile?: boolean;
   /** Registered tool names. XML blocks naming only unknown tools do not
    * suppress the JSON and code-block fallback layers. */
   knownTools?: string[];
@@ -149,6 +163,39 @@ function pickFilename(line: string, knownFiles?: string[]): string | undefined {
   );
 }
 
+/** A comment line that is ONLY a filename marker (e.g. `# test_calc.py`). */
+function bareFilenameMarker(line: string, knownFiles?: string[]): string | null {
+  const prefix = line.trim().match(COMMENT_PREFIX);
+  if (!prefix) return null;
+  const match = line.trim().slice(prefix[0].length).match(MARKER_BARE);
+  if (!match || !isWritablePath(match[1], knownFiles)) return null;
+  return match[1];
+}
+
+/**
+ * Weak models pack several files into ONE fence, separated by bare
+ * filename-marker comments (`# test_calc.py`). Split them so each file
+ * gets its own Write instead of everything merging into the first file.
+ */
+function splitMultiFileFence(
+  body: string,
+  knownFiles?: string[],
+): Array<{ path?: string; body: string }> {
+  const lines = body.split('\n');
+  const segments: Array<{ path?: string; lines: string[] }> = [{ lines: [] }];
+  for (let i = 0; i < lines.length; i++) {
+    const marker = i > 0 ? bareFilenameMarker(lines[i], knownFiles) : null;
+    if (marker) {
+      segments.push({ path: marker, lines: [] });
+    } else {
+      segments[segments.length - 1].lines.push(lines[i]);
+    }
+  }
+  return segments
+    .map((seg) => ({ path: seg.path, body: seg.lines.join('\n').replace(/^\n+/, '') }))
+    .filter((seg) => seg.body.trim() || seg.path === undefined);
+}
+
 /**
  * Detects a filename marker comment on the fence's first line and returns
  * the content with the marker stripped.
@@ -214,20 +261,58 @@ function sniffCodeLanguage(content: string): string | null {
   return null;
 }
 
-function uniquePreferredPath(lang: string, preferredFiles?: string[]): string | undefined {
+function uniquePreferredPath(
+  lang: string,
+  preferredFiles?: string[],
+  guess = false,
+): string | undefined {
   if (!preferredFiles?.length) return undefined;
   const extensions = LANGUAGE_EXTENSIONS[lang.toLowerCase()];
   const candidates = preferredFiles.filter((file) => {
     if (!extensions || !lang) return true;
     return extensions.has(file.split('.').at(-1)?.toLowerCase() ?? '');
   });
-  return candidates.length === 1 ? candidates[0] : undefined;
+  if (candidates.length === 1) return candidates[0];
+  // Guessing requires a mapped fence language so an unlabeled snippet of
+  // shell commands or prose is never proposed as source-file contents.
+  if (guess && extensions && candidates.length) return candidates[0];
+  return undefined;
+}
+
+/** Conventional filename for a new file in an otherwise empty project. */
+const DEFAULT_NEW_FILE: Record<string, string> = {
+  python: 'main.py',
+  py: 'main.py',
+  c: 'main.c',
+  cpp: 'main.cpp',
+  javascript: 'main.js',
+  js: 'main.js',
+  typescript: 'main.ts',
+  ts: 'main.ts',
+  java: 'Main.java',
+  go: 'main.go',
+  rust: 'main.rs',
+};
+
+function defaultNewFilePath(lang: string, knownFiles?: string[]): string | undefined {
+  const name = DEFAULT_NEW_FILE[lang.toLowerCase()];
+  if (!name) return undefined;
+  const extensions = LANGUAGE_EXTENSIONS[lang.toLowerCase()];
+  // Only when the project has no file of this language — otherwise the
+  // preferred-file logic owns the decision and a stray main.py would just
+  // shadow the student's real entry point.
+  const hasSameLanguageFile = knownFiles?.some((file) =>
+    extensions?.has(file.split('.').at(-1)?.toLowerCase() ?? ''),
+  );
+  return hasSameLanguageFile ? undefined : name;
 }
 
 function parseCodeBlockLayer(
   response: string,
   knownFiles?: string[],
   preferredFiles?: string[],
+  guessPreferredFile = false,
+  fallbackNewFile = false,
 ): ParsedToolCall[] {
   const calls: ParsedToolCall[] = [];
   for (const match of response.matchAll(CODE_BLOCK)) {
@@ -277,10 +362,34 @@ function parseCodeBlockLayer(
       body = inside.content;
     }
 
+    // One fence, several files: emit later marker-separated segments as
+    // their own Writes; the first segment continues the normal path logic.
+    const segments = splitMultiFileFence(body, knownFiles);
+    if (segments.length > 1) {
+      body = segments[0].body;
+      for (const seg of segments.slice(1)) {
+        const canonicalSeg = canonicalKnownPath(seg.path!, knownFiles);
+        if (canonicalSeg === null) continue;
+        calls.push({
+          tool: 'Write',
+          args: { path: canonicalSeg, content: seg.body },
+          raw: '',
+          source: 'codeblock',
+        });
+      }
+      if (!body.trim()) continue;
+    }
+
     // If relevance ranking found exactly one matching non-test source file,
     // a filename-less implementation fence is unambiguous. This is kept out
     // of the generic known-file list so two same-language files still nudge.
-    path ??= uniquePreferredPath(lang, preferredFiles);
+    path ??= uniquePreferredPath(lang, preferredFiles, guessPreferredFile);
+
+    // Empty/new project: give the first reply's code a conventional home
+    // instead of dropping it and hoping the nudged retry names a file.
+    if (!path && fallbackNewFile && !markdownProse) {
+      path = defaultNewFilePath(lang, knownFiles);
+    }
 
     if (!path) continue;
     // Markdown prose only ever belongs in markdown/plain-text files.
@@ -334,7 +443,13 @@ export function parseToolCalls(response: string, options: ParseOptions = {}): Pa
   if (calls.length && junk.length === calls.length) calls = [];
   if (!calls.length) calls = parseJsonLayer(response);
   if (!calls.length && options.codeBlockWriteFallback) {
-    calls = parseCodeBlockLayer(response, options.knownFiles, options.preferredFiles);
+    calls = parseCodeBlockLayer(
+      response,
+      options.knownFiles,
+      options.preferredFiles,
+      options.guessPreferredFile,
+      options.fallbackNewFile,
+    );
     calls.push(...junk.map((c) => ({ ...c, args: {} })));
   }
 

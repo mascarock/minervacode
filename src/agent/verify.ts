@@ -13,7 +13,13 @@ export interface VerifyCommand {
   source: string;
   /** Optional shorter timeout for directly executed smoke-test programs. */
   timeoutMs?: number;
+  /** The request asks for printed output — an empty run is a failure. */
+  expectOutput?: boolean;
 }
+
+/** The request asks for a program whose point is PRINTING something. */
+const EXPECTS_PRINTED_OUTPUT =
+  /\b(?:print\w*|stamp\w*|output|display\w*|mostra\w*|visualizz\w*|greet\w*|salut\w*|count\w*|conta\w*)\b/i;
 
 /** `- Test: `python -m pytest`` line in the project context file. */
 const CONTEXT_TEST_LINE = /^\s*[-*]?\s*test[^:`]*:\s*`([^`]+)`/im;
@@ -175,6 +181,35 @@ export async function detectVerifyCommand(
         source: 'unittest files',
       };
     }
+    // Plain `def test_*` functions with pytest absent: a syntax check would
+    // never execute the asserts, so "make the tests pass" could never be
+    // verified. Run them with a minimal driver instead.
+    if (contents.some((c) => /^def test_/m.test(c ?? ''))) {
+      const driver = [
+        'import runpy, sys',
+        'failures = 0',
+        `for path in ${JSON.stringify(testFiles)}:`,
+        '    try:',
+        '        module = runpy.run_path(path)',
+        '    except Exception as err:',
+        '        failures += 1',
+        '        print(f"{path} FAILED during collection: {err!r}")',
+        '        continue',
+        '    tests = [(k, v) for k, v in sorted(module.items()) if k.startswith("test_") and callable(v)]',
+        '    for name, fn in tests:',
+        '        try:',
+        '            fn()',
+        '            print(f"{path}::{name} passed")',
+        '        except Exception as err:',
+        '            failures += 1',
+        '            print(f"{path}::{name} FAILED: {err!r}")',
+        'sys.exit(1 if failures else 0)',
+      ].join('\n');
+      return {
+        command: `${compileChanged}python3 - <<'MINERVA_TESTS'\n${driver}\nMINERVA_TESTS`,
+        source: 'python test functions',
+      };
+    }
     const toCheck = [...new Set([...changedPy, ...testFiles])];
     return {
       command: `python3 -m py_compile ${toCheck.map(quote).join(' ')}`,
@@ -188,7 +223,20 @@ export async function detectVerifyCommand(
     return { command: 'npx tsc --noEmit', source: 'tsconfig.json' };
   }
 
-  // No test setup — syntax-check the files that were just changed.
+  // No test setup — check the files that were just changed. A single
+  // changed script is also RUN with dummy piped input: a syntax check alone
+  // passes code that crashes on its first real line, and "verified" must
+  // not mean that. Interactive input() scripts read the dummy lines and
+  // terminate; crashes feed their traceback back into the repair loop.
+  if (changedPy.length === 1) {
+    const file = quote(changedPy[0]);
+    return {
+      command: `python3 -m py_compile ${file} && yes 2 | head -50 | python3 ${file}`,
+      source: 'compile and run',
+      timeoutMs: 10_000,
+      expectOutput: EXPECTS_PRINTED_OUTPUT.test(request),
+    };
+  }
   if (changedPy.length) {
     return {
       command: `python3 -m py_compile ${changedPy.map(quote).join(' ')}`,
@@ -250,6 +298,15 @@ export async function runVerification(
       { command: cmd.command, timeout_ms: cmd.timeoutMs },
       { projectDir, signal },
     );
+    // A print-something program that prints nothing usually defines main()
+    // and never calls it — running "cleanly" is not the requested behavior.
+    if (cmd.expectOutput && (!output.trim() || output.trim() === '(no output)')) {
+      return {
+        ok: false,
+        output:
+          'The program ran but printed NOTHING. The request requires printed output — make sure the file actually executes its logic when run (call main() at the bottom or put the code at top level).',
+      };
+    }
     return { ok: true, output };
   } catch (err) {
     let output = err instanceof Error ? err.message : String(err);

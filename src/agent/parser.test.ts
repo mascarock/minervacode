@@ -207,6 +207,109 @@ x = 1
     expect(result.toolCalls).toEqual([]);
   });
 
+  it('guessPreferredFile proposes the top-ranked match among several (assisted)', () => {
+    const response = 'Here is the script:\n\n```python\nprint("hi")\n```';
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['greet.py', 'main.py'],
+      preferredFiles: ['greet.py', 'main.py'],
+      guessPreferredFile: true,
+    });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'Write',
+        args: { path: 'greet.py', content: 'print("hi")\n' },
+      }),
+    ]);
+  });
+
+  it('guessPreferredFile still requires a mapped fence language', () => {
+    const unlabeled = 'Example:\n\n```\nsome output\n```';
+    const shell = 'Run:\n\n```bash\npython3 main.py\n```';
+    for (const response of [unlabeled, shell]) {
+      const result = parseToolCalls(response, {
+        codeBlockWriteFallback: true,
+        knownFiles: ['greet.py', 'main.py'],
+        preferredFiles: ['greet.py', 'main.py'],
+        guessPreferredFile: true,
+      });
+      expect(result.toolCalls).toEqual([]);
+    }
+  });
+
+  it('fallbackNewFile targets main.py for a filename-less fence in an empty project', () => {
+    const response = "Here's a simple script:\n\n```python\nimport datetime\nprint(datetime.date.today())\n```";
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: [],
+      fallbackNewFile: true,
+    });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'Write',
+        args: expect.objectContaining({ path: 'main.py' }),
+      }),
+    ]);
+  });
+
+  it('fallbackNewFile stays out of projects that already have same-language files', () => {
+    const response = 'Example:\n\n```python\nx = 1\n```';
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['greet.py', 'README.md'],
+      fallbackNewFile: true,
+    });
+    expect(result.toolCalls).toEqual([]);
+  });
+
+  it('fallbackNewFile ignores unlabeled and prose fences', () => {
+    for (const response of ['```\nsome text\n```', '```markdown\njust prose\n```']) {
+      const result = parseToolCalls(response, {
+        codeBlockWriteFallback: true,
+        knownFiles: [],
+        fallbackNewFile: true,
+      });
+      expect(result.toolCalls).toEqual([]);
+    }
+  });
+
+  it('guessPreferredFile applies to code sniffed out of a ```markdown fence', () => {
+    const response = '```markdown\nimport math\n\ndef f():\n    return math.pi\n```';
+    const result = parseToolCalls(response, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['greet.py', 'main.py'],
+      preferredFiles: ['main.py', 'greet.py'],
+      guessPreferredFile: true,
+    });
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'Write',
+        args: expect.objectContaining({ path: 'main.py' }),
+      }),
+    ]);
+  });
+
+  it('splits a fence that packs several files behind marker comments', () => {
+    const response =
+      'Updated `calc.py`:\n\n```python\ndef add(a, b):\n    return a + b\n\n# test_calc.py\nfrom calc import add\n\ndef test_add():\n    assert add(2, 3) == 5\n```';
+    const result = parseToolCalls(response, { codeBlockWriteFallback: true });
+    expect(result.toolCalls).toHaveLength(2);
+    const byPath = Object.fromEntries(
+      result.toolCalls.map((c) => [c.args.path, c.args.content]),
+    );
+    expect(byPath['calc.py']).toBe('def add(a, b):\n    return a + b\n');
+    expect(byPath['test_calc.py']).toContain('def test_add');
+    expect(byPath['calc.py']).not.toContain('test_add');
+  });
+
+  it('does not split on descriptive comments that merely mention a file', () => {
+    const response =
+      'Updated `calc.py`:\n\n```python\ndef add(a, b):\n    # keeps parity with test_calc.py expectations\n    return a + b\n```';
+    const result = parseToolCalls(response, { codeBlockWriteFallback: true });
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls[0].args.path).toBe('calc.py');
+  });
+
   it('detects a filename marker comment inside the fence and strips it', () => {
     const response = '```python\n# Updated `calc.py`\n\ndef add(a, b):\n    return a + b\n```';
     const result = parseToolCalls(response, { codeBlockWriteFallback: true });

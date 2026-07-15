@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  latestCodeBlock,
   parseInline,
   parseMarkdown,
   renderMarkdownAnsi,
@@ -113,6 +114,35 @@ describe('parseInline', () => {
       { text: ' (https://x.dev)', dim: true },
       { text: ' now' },
     ]);
+  });
+});
+
+describe('latestCodeBlock', () => {
+  const texts = [
+    'First reply:\n\n```python\nx = 1\n```',
+    'Prose only, no code.',
+    'Second reply:\n\n```python\ny = 2\n```\n\nAnd:\n\n```\nz = 3\n```',
+  ];
+
+  it('returns the newest block by default', () => {
+    expect(latestCodeBlock(texts)).toEqual({ lang: '', content: 'z = 3' });
+  });
+
+  it('counts further back with the back parameter', () => {
+    expect(latestCodeBlock(texts, 2)).toEqual({ lang: 'python', content: 'y = 2' });
+    expect(latestCodeBlock(texts, 3)).toEqual({ lang: 'python', content: 'x = 1' });
+  });
+
+  it('returns null when out of range or no code exists', () => {
+    expect(latestCodeBlock(texts, 4)).toBeNull();
+    expect(latestCodeBlock(['just prose'])).toBeNull();
+  });
+
+  it('skips empty code blocks', () => {
+    expect(latestCodeBlock(['```python\nx = 1\n```\n\n```\n\n```'])).toEqual({
+      lang: 'python',
+      content: 'x = 1',
+    });
   });
 });
 

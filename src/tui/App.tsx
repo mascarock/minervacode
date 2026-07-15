@@ -8,6 +8,8 @@ import { saveConfig } from '../auth/store.js';
 import { gatherSessionInfo } from '../session.js';
 import type { ChatMessage, MinervaConfig, ModelInfo, SessionInfo } from '../types.js';
 import { HELP_LINES, sessionInfoLines } from '../ui/info.js';
+import { copyToClipboard } from '../ui/clipboard.js';
+import { latestCodeBlock } from '../ui/markdown.js';
 import { runAgent } from '../agent/loop.js';
 import { ChangeLog } from '../agent/context.js';
 import { collectGitDiff, runReview } from '../agent/review.js';
@@ -240,6 +242,33 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
       return push({
         kind: 'system',
         text: `${lines.join('\n')}\n* requires approval depending on mode`,
+      });
+    }
+
+    if (cmd === '/copy') {
+      const back = rawArg ? Number.parseInt(rawArg, 10) : 1;
+      if (!Number.isInteger(back) || back < 1) {
+        return push({
+          kind: 'system',
+          text: 'Usage: /copy [n] — copies the newest code block; n counts further back.',
+        });
+      }
+      const texts = entries
+        .filter((e): e is Entry & { kind: 'assistant' } => e.kind === 'assistant')
+        .map((e) => e.text);
+      const block = latestCodeBlock(texts, back);
+      if (!block) {
+        return push({
+          kind: 'system',
+          text: back === 1 ? 'No code block in this conversation yet.' : `No code block ${back} back.`,
+        });
+      }
+      const content = block.content.endsWith('\n') ? block.content : `${block.content}\n`;
+      await copyToClipboard(content);
+      const lines = content.split('\n').length - 1;
+      return push({
+        kind: 'system',
+        text: `Copied ${lines}-line ${block.lang || 'code'} block to the clipboard.`,
       });
     }
 

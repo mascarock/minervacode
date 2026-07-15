@@ -7,10 +7,12 @@ import type { MinervaClient } from '../api/client.js';
 import type { ChatMessage } from '../types.js';
 import {
   MAX_VERIFY_RUNS,
+  definesIdentifier,
   requestExplicitSourcePaths,
   requestAllowsNewFile,
   requestExpectsChanges,
   requestAllowsTestEdit,
+  requestRequiredDefinitions,
   runAgent,
   type AgentEvents,
 } from './loop.js';
@@ -118,6 +120,45 @@ describe('requestExpectsChanges', () => {
     expect(requestExpectsChanges('Correggi il bug in calc.py.')).toBe(true);
     expect(requestExpectsChanges('Explain how to fix calc.js.')).toBe(false);
     expect(requestExpectsChanges('Review the changes.')).toBe(false);
+  });
+
+  it('recognizes exercise-style requests that describe program behavior', () => {
+    expect(
+      requestExpectsChanges(
+        "Chiedi all'utente di inserire tre numeri, dopodiché verifica qual è il più piccolo e sommali.",
+      ),
+    ).toBe(true);
+    expect(requestExpectsChanges('Ask the user for a number and print its square.')).toBe(true);
+    expect(requestExpectsChanges('Stampa i primi 10 numeri primi.')).toBe(true);
+    // Informational phrasing still wins over behavior verbs.
+    expect(requestExpectsChanges('Cosa stampa questo script?')).toBe(false);
+    expect(requestExpectsChanges('Explain what this prints.')).toBe(false);
+  });
+});
+
+describe('requestRequiredDefinitions', () => {
+  it('extracts function names spelled with call syntax', () => {
+    expect(
+      requestRequiredDefinitions('Add a function is_even(n) to utils.py.'),
+    ).toEqual(['is_even']);
+    expect(
+      requestRequiredDefinitions('Create shapes.py with area_circle(r) and area_square(s).'),
+    ).toEqual(['area_circle', 'area_square']);
+  });
+
+  it('ignores common builtins used in prose', () => {
+    expect(requestRequiredDefinitions('Make it print(x) when the user types input().')).toEqual(
+      [],
+    );
+  });
+});
+
+describe('definesIdentifier', () => {
+  it('matches definitions, not calls', () => {
+    expect(definesIdentifier('def is_even(n):\n    return n % 2 == 0\n', 'is_even')).toBe(true);
+    expect(definesIdentifier('print(is_even(4))\n', 'is_even')).toBe(false);
+    expect(definesIdentifier('const isEven = (n) => n % 2 === 0;\n', 'isEven')).toBe(true);
+    expect(definesIdentifier('function greet() {}\n', 'greet')).toBe(true);
   });
 });
 
@@ -601,6 +642,187 @@ describe('autonomous agent loop', () => {
     });
 
     expect(JSON.stringify(requestBodies[1])).toContain('I could not apply anything');
+    expect(await readFile(path.join(projectDir, 'calc.py'), 'utf-8')).toBe('x = 2\n');
+  });
+
+  it('fails honestly when a requested function is never defined', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'utils.py'), 'def double(n):\n    return n * 2\n');
+    const responses = [
+      // The model "adds is_even" but actually just restates double().
+      'Updated `utils.py`:\n\n```python\ndef double(n):\n    """Return n * 2."""\n    return n * 2\n```',
+      'All done!',
+      'All done!',
+      'All done!',
+    ];
+    const client = mockClient(responses);
+
+    const result = await runAgent(client, {
+      history: [],
+      prompt: 'Add a function is_even(n) to utils.py that returns True for even numbers.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    expect(result.status).toBe('requirements-unmet');
+  });
+
+  it('accepts the run once the requested function gets defined after a nudge', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'utils.py'), 'def double(n):\n    return n * 2\n');
+    const responses = [
+      'Updated `utils.py`:\n\n```python\ndef double(n):\n    return n * 2\n```',
+      'Updated `utils.py`:\n\n```python\ndef is_even(n):\n    return n % 2 == 0\n```',
+      'Done.',
+      'LGTM',
+    ];
+    const client = mockClient(responses);
+
+    const result = await runAgent(client, {
+      history: [],
+      prompt: 'Add a function is_even(n) to utils.py.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    expect(result.status).toBe('completed');
+    const content = await readFile(path.join(projectDir, 'utils.py'), 'utf-8');
+    expect(content).toContain('def is_even');
+    expect(content).toContain('def double');
+  });
+
+  it('allows a rename request to drop the renamed definition', async () => {
+    const projectDir = await tempProject();
+    await writeFile(
+      path.join(projectDir, 'calc.py'),
+      'def add(a, b):\n    return a + b\n\nprint(add(1, 2))\n',
+    );
+    const responses = [
+      'Updated `calc.py`:\n\n```python\ndef sum_two(a, b):\n    return a + b\n\nprint(sum_two(1, 2))\n```',
+      'Done.',
+      'LGTM',
+    ];
+    const client = mockClient(responses);
+
+    const result = await runAgent(client, {
+      history: [],
+      prompt: 'Rename the function add to sum_two in calc.py and update its callers.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    expect(result.status).toBe('completed');
+    const content = await readFile(path.join(projectDir, 'calc.py'), 'utf-8');
+    expect(content).toContain('def sum_two');
+    expect(content).not.toContain('def add');
+  });
+
+  it('retries once after a transient model failure', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
+    let calls = 0;
+    const client = {
+      model: 'test-model',
+      async postStream() {
+        calls++;
+        if (calls === 1) throw new Error('Model response timed out after 60000ms');
+        return sseResponse(
+          calls === 2 ? 'Updated `calc.py`:\n\n```python\nx = 2\n```' : 'Done.',
+        );
+      },
+    } as MinervaClient;
+
+    const result = await runAgent(client, {
+      history: [],
+      prompt: 'Set x to 2 in calc.py.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    expect(result.status).toBe('completed');
+    expect(await readFile(path.join(projectDir, 'calc.py'), 'utf-8')).toBe('x = 2\n');
+  });
+
+  it('fails honestly when an ask-the-user program never reads input', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'main.py'), 'print("hi")\n');
+    const responses = [
+      // Regurgitated context code instead of the requested input program.
+      'Updated `main.py`:\n\n```python\nprint("hello world")\n```',
+      'Done.',
+      'Done.',
+      'Done.',
+    ];
+    const client = mockClient(responses);
+
+    const result = await runAgent(client, {
+      history: [],
+      prompt: "Chiedi all'utente un numero e stampa la sua tabellina fino a 10.",
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'it',
+      events: autoEvents(),
+    });
+
+    expect(result.status).toBe('requirements-unmet');
+  });
+
+  it('accepts an ask-the-user program once it reads input after a nudge', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'main.py'), 'print("hi")\n');
+    const responses = [
+      'Updated `main.py`:\n\n```python\nprint("hello world")\n```',
+      'Updated `main.py`:\n\n```python\nn = int(input("Numero: "))\nfor i in range(1, 11):\n    print(n * i)\n```',
+      'Done.',
+      'LGTM',
+    ];
+    const client = mockClient(responses);
+
+    const result = await runAgent(client, {
+      history: [],
+      prompt: "Chiedi all'utente un numero e stampa la sua tabellina fino a 10.",
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'it',
+      events: autoEvents(),
+    });
+
+    expect(result.status).toBe('completed');
+    expect(await readFile(path.join(projectDir, 'main.py'), 'utf-8')).toContain('input(');
+  });
+
+  it('nudges Italian action claims and web-UI hallucinations', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
+    const responses = [
+      'Ho creato una funzione. Se vuoi vedere il codice, clicca sul pulsante "Show Code".',
+      'Updated `calc.py`:\n\n```python\nx = 2\n```',
+      'Done.',
+      'LGTM',
+    ];
+    const requestBodies: unknown[] = [];
+    const client = mockClient(responses, requestBodies);
+
+    await runAgent(client, {
+      history: [],
+      prompt: 'Scrivi la funzione in calc.py.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'it',
+      events: autoEvents(),
+    });
+
+    const nudge = JSON.stringify(requestBodies[1]);
+    expect(nudge).toContain('I could not apply anything');
+    expect(nudge).toContain('no buttons');
     expect(await readFile(path.join(projectDir, 'calc.py'), 'utf-8')).toBe('x = 2\n');
   });
 

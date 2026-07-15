@@ -5,7 +5,11 @@ import type { ChatMessage } from '../types.js';
 import { getTool, getTools } from '../tools/registry.js';
 import { resolveInProject, type Tool } from '../tools/tool.js';
 import type { AppliedChange, ChangeLog } from './context.js';
-import { mergePartialWrite, removedTopLevelDefinitions } from './merge.js';
+import {
+  mergePartialWrite,
+  protectedDefinitionNames,
+  removedTopLevelDefinitions,
+} from './merge.js';
 import { parseToolCalls } from './parser.js';
 import { needsApproval, type PermissionMode } from './permissions.js';
 import { buildPreview, filePatch, readIfExists } from './preview.js';
@@ -64,10 +68,17 @@ const FORBIDS_NEW_FILES =
 const SOURCE_FILE_PATH = /\.(?:[cm]?[jt]sx?|py|go|rs|java|c|cc|cpp|cxx|h|hpp)$/i;
 const EXPECTS_FILE_CHANGES =
   /\b(?:fix\w*|correct\w*|creat\w*|writ\w*|add\w*|updat\w*|modif\w*|edit\w*|chang\w*|implement\w*|refactor\w*|remove\w*|rename\w*|corregg\w*|sistem\w*|crea\w*|scriv\w*|aggiung\w*|aggiorn\w*|modific\w*|cambi\w*|implementa\w*|rimuov\w*|rinomina\w*)\b/i;
+/**
+ * Exercise-style requests describe the PROGRAM's behavior instead of naming
+ * a file change: "Chiedi all'utente tre numeri e sommali", "Ask the user for
+ * a number and print the square". These expect code to be written too.
+ */
+const PROGRAM_SPEC =
+  /\b(?:chied\w*|stamp\w*|calcol\w*|somm\w*|inser\w*|restitu\w*|print\w*|comput\w*|sum\b|input\b|output\b|ask(?:s|ing)?\b|prompt\s+the\s+user)\b/i;
 const INFORMATIONAL_REQUEST =
   /^\s*(?:explain|review|inspect|analy[sz]e|describe|why|how|what|show\s+me|spiega|rivedi|analizza|descrivi|perch[eé]|come|cosa)\b/i;
 const ALLOWS_DEFINITION_REMOVAL =
-  /\b(?:remov\w*|delet\w*|rewrit\w*|replace\w*|refactor\w*|rimuov\w*|elimina\w*|riscriv\w*|sostitui\w*|rifattorizz\w*)\b/i;
+  /\b(?:remov\w*|delet\w*|rewrit\w*|replace\w*|refactor\w*|renam\w*|rimuov\w*|elimina\w*|riscriv\w*|sostitui\w*|rifattorizz\w*|rinomin\w*)\b/i;
 
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
@@ -95,11 +106,42 @@ export function requestAllowsNewFile(prompt: string): boolean {
 }
 
 export function requestExpectsChanges(prompt: string): boolean {
-  return !INFORMATIONAL_REQUEST.test(prompt) && EXPECTS_FILE_CHANGES.test(prompt);
+  return (
+    !INFORMATIONAL_REQUEST.test(prompt) &&
+    (EXPECTS_FILE_CHANGES.test(prompt) || PROGRAM_SPEC.test(prompt))
+  );
 }
 
 const EXPLICIT_SOURCE_PATH =
   /(?:^|[\s`"'([{])((?:\.\/)?(?:[\w@+.-]+\/)*[\w@+.-]+\.(?:[cm]?[jt]sx?|py|go|rs|java|c|cc|cpp|cxx|h|hpp))(?=$|[\s`"',;:!?)\]}]|\.(?:\s|$))/gi;
+
+/** Names that appear with call parens in prose without being the target. */
+const COMMON_CALL_NAMES = new Set([
+  'print', 'input', 'println', 'printf', 'scanf', 'main', 'len', 'range',
+  'str', 'int', 'float', 'bool', 'log', 'console', 'require', 'import',
+]);
+
+/**
+ * Function names the request spells out with call syntax, e.g. "add a
+ * function is_even(n)". A run that never defines them did not do the task,
+ * no matter how cleanly its other changes verify.
+ */
+export function requestRequiredDefinitions(prompt: string): string[] {
+  const names = [...prompt.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)]
+    .map((match) => match[1])
+    .filter((name) => !COMMON_CALL_NAMES.has(name.toLowerCase()));
+  return [...new Set(names)];
+}
+
+/** Does this file content define (not merely call) the named function? */
+export function definesIdentifier(content: string, name: string): boolean {
+  return new RegExp(
+    String.raw`\b(?:def|function|func|fn)\s+${name}\s*\(` +
+      String.raw`|(?:const|let|var)\s+${name}\s*=` +
+      String.raw`|class\s+${name}\b` +
+      String.raw`|\b(?:int|void|double|float|char|bool|long|unsigned)\s+\**${name}\s*\(`,
+  ).test(content);
+}
 
 /** Source paths the student wrote literally in the request, in request order. */
 export function requestExplicitSourcePaths(prompt: string): string[] {
@@ -216,6 +258,12 @@ async function executeCall(
   }
 }
 
+/** First line of a multi-line command, for status/tool display. */
+function compactCommand(command: string): string {
+  const [first, ...rest] = command.split('\n');
+  return rest.length ? `${first} …` : command;
+}
+
 function turnLimitMessage(language: AgentLanguage = 'auto'): string {
   return language === 'it'
     ? '(Limite di turni raggiunto — riprendi con un nuovo messaggio.)'
@@ -224,12 +272,24 @@ function turnLimitMessage(language: AgentLanguage = 'auto'): string {
 
 /** The model claims to have acted ("I've fixed…") without any tool call. */
 const ACTION_CLAIM =
-  /\b(?:i(?:'ve| have)?\s+(?:fixed|updated|changed|corrected|modified|implemented)|ho\s+(?:corretto|aggiornato|modificato|sistemato|implementato))\b/i;
+  /\b(?:i(?:'ve| have)?\s+(?:fixed|updated|changed|corrected|modified|implemented|created|added|written)|ho\s+(?:corretto|aggiornato|modificato|sistemato|implementato|creato|scritto|aggiunto|generato))\b/i;
+
+/** The model hallucinates a web UI ("click the Show Code button"). */
+const UI_CLAIM = /\b(?:show\s+code|pulsante|button|click\w*|clicc\w*)\b/i;
+
+/** The request asks for a program that READS USER INPUT. */
+const EXPECTS_USER_INPUT =
+  /\b(?:chied\w*|inserisc\w*|inserire|ask(?:s|ing)?\b|prompt(?:s|ing)?\s+(?:the\s+)?user)\b/i;
+
+/** Does any changed Python file actually read from stdin? */
+function readsUserInput(contents: string[]): boolean {
+  return contents.some((c) => /\binput\s*\(|\bsys\.stdin\b|\braw_input\s*\(/.test(c));
+}
 
 /** One-time correction when the model showed code but nothing was applicable. */
 function formatNudge(projectFiles: string[], requiredPaths: string[] = []): string {
   const example = requiredPaths[0] ?? projectFiles.find((f) => !f.endsWith('/')) ?? 'main.py';
-  return `I could not apply anything from that reply. To change a file, either emit a structured tool call:
+  return `I could not apply anything from that reply. This is a plain terminal: there are no buttons, panels, or "Show Code" links, so any code must be written out in the reply itself. To change a file, either emit a structured tool call:
 
 <minerva_tool name="Write">
 <path>${example}</path>
@@ -289,9 +349,11 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     if (cmd && /test|pytest|unittest|\.minervacli\.md/i.test(cmd.source)) {
       const bash = getTool('Bash');
       const event: ToolCallEvent | null = bash
-        ? { tool: bash, input: { command: cmd.command }, summary: cmd.command }
+        ? { tool: bash, input: { command: cmd.command }, summary: compactCommand(cmd.command) }
         : null;
-      opts.events.onStatus?.(`Running initial verification (${cmd.source}): ${cmd.command}`);
+      opts.events.onStatus?.(
+        `Running initial verification (${cmd.source}): ${compactCommand(cmd.command)}`,
+      );
       if (event) opts.events.onToolStart(event);
       const baseline = await runVerification(cmd, opts.projectDir, opts.signal);
       if (event) opts.events.onToolEnd({ ...event, ok: baseline.ok, result: baseline.output });
@@ -341,6 +403,13 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   let failedVerificationNudges = 0;
   let nudged = false;
   let requirementsNudges = 0;
+  let missingDefNudges = 0;
+  let inputNudges = 0;
+  const requiredDefs = requestExpectsChanges(opts.prompt)
+    ? requestRequiredDefinitions(opts.prompt)
+    : [];
+  const requiresUserInput =
+    requestExpectsChanges(opts.prompt) && EXPECTS_USER_INPUT.test(opts.prompt);
   let reviewed = false;
   let compactionReported = false;
 
@@ -422,9 +491,9 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     verifyRuns++;
     const bash = getTool('Bash');
     const event: ToolCallEvent | null = bash
-      ? { tool: bash, input: { command: cmd.command }, summary: cmd.command }
+      ? { tool: bash, input: { command: cmd.command }, summary: compactCommand(cmd.command) }
       : null;
-    opts.events.onStatus?.(`Verifying changes (${cmd.source}): ${cmd.command}`);
+    opts.events.onStatus?.(`Verifying changes (${cmd.source}): ${compactCommand(cmd.command)}`);
     if (event) opts.events.onToolStart(event);
     const { ok, output } = await runVerification(cmd, opts.projectDir, opts.signal);
     if (event) opts.events.onToolEnd({ ...event, ok, result: output });
@@ -445,14 +514,22 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     return true;
   };
 
+  let modelRetries = 1;
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     compactContext();
     let response: string;
     try {
       response = await streamChat(client, messages, { signal: opts.signal });
     } catch (err) {
-      status = 'model-error';
       const message = err instanceof Error ? err.message : String(err);
+      // One transient timeout must not kill a whole run — the request is
+      // idempotent (nothing was appended to the conversation yet).
+      if (modelRetries > 0 && !opts.signal?.aborted) {
+        modelRetries--;
+        opts.events.onStatus?.(`⚠ Model request failed: ${message} — retrying once…`);
+        continue;
+      }
+      status = 'model-error';
       finalText = message;
       opts.events.onStatus?.(`⚠ Model request failed: ${message}`);
       break;
@@ -470,6 +547,12 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
           ? requiredNewPaths
           : repoMap.contextFiles.filter((file) => !TEST_FILE_PATH.test(file))
         : undefined,
+      // In assisted mode the student approves every proposed Write, so a
+      // best-guess target for a filename-less fence beats a dead end.
+      guessPreferredFile: !auto,
+      // "Write me a script …" against an empty project: default to main.py
+      // (& co.) so the first reply's code is applied instead of dropped.
+      fallbackNewFile: requestExpectsChanges(opts.prompt),
       knownTools: tools.map((t) => t.name),
     });
     if (text) {
@@ -488,7 +571,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       if (
         !nudged &&
         !changes.length &&
-        (response.includes('```') || ACTION_CLAIM.test(response))
+        (response.includes('```') || ACTION_CLAIM.test(response) || UI_CLAIM.test(response))
       ) {
         nudged = true;
         messages.push({
@@ -517,6 +600,57 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
           `⚠ Required output ${missingRequiredPaths.join(', ')} was not created.`,
         );
         break;
+      }
+
+      // The request spelled out function names (e.g. "add is_even(n)") that
+      // no changed file defines — passing checks on OTHER lines is not the
+      // task. Ask for the missing definition, then fail honestly.
+      const missingDefs =
+        auto && requiredDefs.length
+          ? requiredDefs.filter(
+              (name) =>
+                ![...netState.values()].some(
+                  (s) => definesIdentifier(s.after, name) || definesIdentifier(s.before, name),
+                ),
+            )
+          : [];
+      if (missingDefs.length) {
+        if (missingDefNudges < 2) {
+          missingDefNudges++;
+          messages.push({
+            role: 'user',
+            content: `The request explicitly requires defining ${missingDefs.map((n) => `${n}(...)`).join(', ')} and the current changes do not define ${missingDefs.length === 1 ? 'it' : 'them'}. Emit a Write or Edit now that adds the missing definition${missingDefs.length === 1 ? '' : 's'} without removing existing code.`,
+          });
+          continue;
+        }
+        status = 'requirements-unmet';
+        opts.events.onStatus?.(
+          `⚠ Required function${missingDefs.length === 1 ? '' : 's'} ${missingDefs.join(', ')} ${missingDefs.length === 1 ? 'was' : 'were'} never defined.`,
+        );
+        break;
+      }
+
+      // "Chiedi all'utente…" / "Ask the user…" programs must actually read
+      // input. A run that changed Python files none of which touch stdin
+      // did something else entirely (usually regurgitated context code).
+      if (auto && requiresUserInput && netState.size) {
+        const pyContents = [...netState.entries()]
+          .filter(([path]) => path.endsWith('.py'))
+          .map(([, s]) => s.after);
+        if (pyContents.length && !readsUserInput(pyContents)) {
+          if (inputNudges < 2) {
+            inputNudges++;
+            messages.push({
+              role: 'user',
+              content:
+                'The request asks for a program that READS USER INPUT, but no changed file calls input(). Rewrite the requested program so it asks the user with input() and prints the result.',
+            });
+            continue;
+          }
+          status = 'requirements-unmet';
+          opts.events.onStatus?.('⚠ The requested program never reads user input.');
+          break;
+        }
       }
 
       if (
@@ -726,10 +860,18 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       if (call.source === 'codeblock' && tool.name === 'Write' && !createdThisRun) {
         try {
           const target = resolveInProject(opts.projectDir, String(input.path));
+          const existing = await readIfExists(target);
+          // A request that names its new functions ("add is_even(n)") does
+          // not authorize rewriting unmentioned existing ones — the model
+          // often restates them with subtly broken bodies.
+          const protectedNames = requiredDefs.length
+            ? protectedDefinitionNames(String(input.path), existing, opts.prompt)
+            : undefined;
           const merged = mergePartialWrite(
             String(input.path),
-            await readIfExists(target),
+            existing,
             String(input.content),
+            protectedNames,
           );
           if (merged !== null) input.content = merged;
         } catch {

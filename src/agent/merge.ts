@@ -173,6 +173,7 @@ function mergeBlocks(
   findBlocks: (lines: string[]) => Block[],
   importLine: RegExp,
   preserveExports = false,
+  protectedNames?: Set<string>,
 ): string | null {
   const oldLines = existing.split('\n');
   const newLines = proposed.split('\n');
@@ -183,10 +184,23 @@ function mergeBlocks(
   const oldNames = new Set(oldBlocks.map((b) => b.name));
   const newNames = new Set(newBlocks.map((b) => b.name));
   const shared = [...newNames].filter((n) => oldNames.has(n));
-  // Nothing overlaps — there is no anchor to merge on.
-  if (!shared.length) return null;
+  // Nothing overlaps: with loose statements in the proposal there is no
+  // anchor to merge on (a rewrite or another file's content). But a
+  // proposal of ONLY new definitions and imports is an addition — "add a
+  // function is_even" answered with just that function must append, not
+  // overwrite-and-lose the rest of the file.
+  if (!shared.length) {
+    const looseNewCode = moduleLevelLines(newLines, newBlocks).some(
+      (line) => !importLine.test(line.trim()),
+    );
+    if (looseNewCode) return null;
+  }
 
-  const coversAllDefs = [...oldNames].every((n) => newNames.has(n));
+  // A protected name is never "covered" — restating it does not authorize
+  // the full-file-rewrite escape below, the old body must survive.
+  const coversAllDefs = [...oldNames].every(
+    (n) => newNames.has(n) && !protectedNames?.has(n),
+  );
   const newModuleCode = moduleLevelLines(newLines, newBlocks).length > 0;
   const oldModuleCode = moduleLevelLines(oldLines, oldBlocks).length > 0;
   // A real full-file proposal restates every definition AND whatever
@@ -194,8 +208,13 @@ function mergeBlocks(
   // the module-level code is still partial.
   if (coversAllDefs && (newModuleCode || !oldModuleCode)) return null;
 
+  // Protected definitions keep their existing body: on an "add is_even(n)"
+  // request a weak model often restates double() with a WRONG body in the
+  // same fence, and nothing in the request authorizes changing double.
   const replacements = new Map(
-    newBlocks.filter((b) => oldNames.has(b.name)).map((b) => [b.name, b]),
+    newBlocks
+      .filter((b) => oldNames.has(b.name) && !protectedNames?.has(b.name))
+      .map((b) => [b.name, b]),
   );
   const additions = newBlocks
     .filter((b) => !oldNames.has(b.name))
@@ -248,15 +267,45 @@ export function mergePartialWrite(
   path: string,
   existing: string,
   proposed: string,
+  protectedNames?: Set<string>,
 ): string | null {
   if (!existing.trim()) return null;
   if (path.endsWith('.py')) {
-    return mergeBlocks(existing, proposed, topLevelBlocks, IMPORT_LINE);
+    return mergeBlocks(existing, proposed, topLevelBlocks, IMPORT_LINE, false, protectedNames);
   }
   if (/\.(?:[cm]?[jt]sx?)$/.test(path)) {
-    return mergeBlocks(existing, proposed, javaScriptBlocks, JS_IMPORT_LINE, true);
+    return mergeBlocks(
+      existing,
+      proposed,
+      javaScriptBlocks,
+      JS_IMPORT_LINE,
+      true,
+      protectedNames,
+    );
   }
   return null;
+}
+
+/**
+ * Existing top-level definitions the request never mentions. When the
+ * request explicitly targets OTHER functions ("add is_even(n)"), these are
+ * protected from body rewrites during a partial-write merge.
+ */
+export function protectedDefinitionNames(
+  path: string,
+  existing: string,
+  prompt: string,
+): Set<string> {
+  const findBlocks = path.endsWith('.py')
+    ? topLevelBlocks
+    : /\.(?:[cm]?[jt]sx?)$/.test(path)
+      ? javaScriptBlocks
+      : null;
+  if (!findBlocks) return new Set();
+  const names = findBlocks(existing.split('\n')).map((block) => block.name);
+  return new Set(
+    names.filter((name) => !new RegExp(String.raw`\b${name}\b`, 'i').test(prompt)),
+  );
 }
 
 /** Definitions an overwrite would delete, used as an autonomous safety gate. */

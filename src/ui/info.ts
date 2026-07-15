@@ -40,6 +40,7 @@ export const HELP_LINES = [
   '/repomap show the ranked repository structure (/repomap <focus>)',
   '/context show context use and compact old bulk if needed',
   '/tools   list agent tools',
+  '/copy    copy the newest code block to the clipboard (/copy 2 = one older)',
   '/diff    show changes applied this session',
   '/review  ask Minerva to review session changes (or the git diff)',
   '/clear   clear conversation history',
