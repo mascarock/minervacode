@@ -4,9 +4,7 @@ A terminal chat client and **assisted coding companion** for [Chat Minerva](http
 
 Chat Minerva runs on **Open WebUI v0.7.2**. This CLI lets you log in and chat from a Claude Code-style terminal UI, and lets Minerva propose, apply, and check code changes in your project: every change is shown as a diff you approve (assisted mode, the default and recommended way to use it), and the CLI — not the model — runs your tests to verify the result.
 
-**Honest expectations:** Minerva is a **7B model without native tool calling**. It is genuinely useful for explaining code, working through small Python homework, and proposing focused fixes that you review. It is **not** a reliable autonomous agent: in our live testing it could not once produce a compilable C program (0 of 28 attempts, even with error feedback), and some runnable Python attempts printed wrong results. The CLI is built around that reality — deterministic verification, honest failure reporting, and rollback — instead of pretending otherwise.
-
-![Auto mode: write → verify → review](assets/demo-agent.svg)
+![Auto mode: write → verify → review](assets/demo-video.gif)
 
 ## Requirements
 
@@ -220,7 +218,9 @@ it honest:
   or erase unrelated top-level definitions. A mutating one-shot request that
   produces no applicable change exits nonzero instead of claiming success.
 
-### Measured limitations
+### Honest expectations & measured limitations
+
+Minerva is a **7B model without native tool calling**. It is genuinely useful for explaining code, working through small Python homework, and proposing focused fixes that you review — but it is not a reliable autonomous agent, and the CLI is built around that reality: deterministic verification, honest failure reporting, and rollback.
 
 So you know what you're getting (live `chatminerva.org` testing, July 2026):
 
