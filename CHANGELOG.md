@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0 — 2026-07-16
+
+Rebranded from `minervacli` to **MinervaCode** (`minervacode` on npm).
+
+- CLI command: `minervacode`
+- Config directory: `~/.minervacode/`
+- Project context file: `.minervacode.md`
+
 ## 0.4.3 — 2026-07-15
 
 Techniques adopted from a research sweep over open-source agentic CLIs

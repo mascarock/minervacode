@@ -3,7 +3,7 @@ dist/
 .env
 .env.*
 *.env
-.minervacli/
+.minervacode/
 config.json
 scripts/stress.sh
-minervacli-0.4.3.tgz
+*.tgz

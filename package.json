@@ -1,20 +1,17 @@
 {
-  "name": "@mascarock/minervacli",
-  "version": "0.4.3",
-  "description": "Terminal chat client and assisted coding companion for Chat Minerva",
+  "name": "minervacode",
+  "version": "0.5.0",
+  "description": "Terminal coding companion for Chat Minerva — propose, approve, and verify code changes from the CLI",
   "license": "MIT",
   "author": "Mascarock",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mascarock/minervacli.git"
+    "url": "git+https://github.com/mascarock/minervacode.git"
   },
   "bugs": {
-    "url": "https://github.com/mascarock/minervacli/issues"
+    "url": "https://github.com/mascarock/minervacode/issues"
   },
-  "homepage": "https://github.com/mascarock/minervacli#readme",
-  "publishConfig": {
-    "access": "public"
-  },
+  "homepage": "https://github.com/mascarock/minervacode#readme",
   "type": "module",
   "main": "./dist/index.js",
   "files": [
@@ -26,7 +23,7 @@
     "LICENSE"
   ],
   "bin": {
-    "minervacli": "./bin/minervacli"
+    "minervacode": "./bin/minervacode"
   },
   "scripts": {
     "prebuild": "node --eval \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
