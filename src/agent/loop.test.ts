@@ -35,14 +35,18 @@ async function tempProject(): Promise<string> {
   return projectDir;
 }
 
-function mockClient(responses: string[], requestBodies: unknown[] = []): MinervaClient {
+function stubClient(postStream: MinervaClient['postStream']): MinervaClient {
   return {
     model: 'test-model',
-    async postStream(_path: string, body: unknown) {
-      requestBodies.push(body);
-      return sseResponse(responses.shift() ?? 'Done.');
-    },
-  } as MinervaClient;
+    postStream,
+  } as unknown as MinervaClient;
+}
+
+function mockClient(responses: string[], requestBodies: unknown[] = []): MinervaClient {
+  return stubClient(async (_path: string, body: unknown) => {
+    requestBodies.push(body);
+    return sseResponse(responses.shift() ?? 'Done.');
+  });
 }
 
 function autoEvents(): AgentEvents {
@@ -521,12 +525,9 @@ describe('autonomous agent loop', () => {
     const events = autoEvents();
     const statuses: string[] = [];
     events.onStatus = (text) => statuses.push(text);
-    const client = {
-      model: 'test-model',
-      async postStream() {
-        throw new Error('upstream unavailable');
-      },
-    } as MinervaClient;
+    const client = stubClient(async () => {
+      throw new Error('upstream unavailable');
+    });
 
     const result = await runAgent(client, {
       history: [],
@@ -926,17 +927,14 @@ describe('autonomous agent loop', () => {
     const events = autoEvents();
     events.onStatus = (text) => statuses.push(text);
     let calls = 0;
-    const client = {
-      model: 'test-model',
-      async postStream() {
-        calls++;
-        if (calls === 1) {
-          return sseResponse('Updated `answer.js`:\n\n```js\nconsole.log(42);\n```');
-        }
-        if (calls === 2) return sseResponse('Done.');
-        throw new Error('review service unavailable');
-      },
-    } as MinervaClient;
+    const client = stubClient(async () => {
+      calls++;
+      if (calls === 1) {
+        return sseResponse('Updated `answer.js`:\n\n```js\nconsole.log(42);\n```');
+      }
+      if (calls === 2) return sseResponse('Done.');
+      throw new Error('review service unavailable');
+    });
 
     const result = await runAgent(client, {
       history: [],
@@ -1121,16 +1119,13 @@ describe('autonomous agent loop', () => {
     const projectDir = await tempProject();
     await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
     let calls = 0;
-    const client = {
-      model: 'test-model',
-      async postStream() {
-        calls++;
-        if (calls === 1) throw new Error('Model response timed out after 60000ms');
-        return sseResponse(
-          calls === 2 ? 'Updated `calc.py`:\n\n```python\nx = 2\n```' : 'Done.',
-        );
-      },
-    } as MinervaClient;
+    const client = stubClient(async () => {
+      calls++;
+      if (calls === 1) throw new Error('Model response timed out after 60000ms');
+      return sseResponse(
+        calls === 2 ? 'Updated `calc.py`:\n\n```python\nx = 2\n```' : 'Done.',
+      );
+    });
 
     const result = await runAgent(client, {
       history: [],
@@ -1657,10 +1652,10 @@ describe('autonomous agent loop', () => {
     expect(requestBodies).toHaveLength(1);
   });
 
-  it('nudges once when the model refuses claiming it cannot write files', async () => {
+  it('nudges once when the model returns a generic refusal', async () => {
     const projectDir = await tempProject();
     const responses = [
-      "I'm sorry, but I am unable to perform actions like writing scripts or running external programs within this chat interface. However, if you would like help understanding how to implement sorting functionality using Python, I'd be happy to assist!",
+      "I'm sorry, but I am unable to fulfill this request.",
       'Updated `main.py`:\n\n```python\nnums = sorted(int(input()) for _ in range(5))\nprint(nums)\n```',
     ];
     const requestBodies: unknown[] = [];
@@ -1682,7 +1677,45 @@ describe('autonomous agent loop', () => {
     });
 
     expect(requestBodies).toHaveLength(2);
+    expect(JSON.stringify(requestBodies[1])).toContain('I could not apply anything');
     expect(existsSync(path.join(projectDir, 'main.py'))).toBe(true);
+  });
+
+  it('stops after one structural nudge when the model still produces no action', async () => {
+    const projectDir = await tempProject();
+    const requestBodies: unknown[] = [];
+    const statuses: string[] = [];
+
+    const result = await runAgent(
+      mockClient(
+        [
+          "I'm sorry, but I am unable to fulfill this request.",
+          'Sorry, I cannot help with that request.',
+        ],
+        requestBodies,
+      ),
+      {
+        history: [],
+        prompt: 'Write a Python script that asks for numbers and prints their square roots.',
+        projectDir,
+        permissionMode: 'default',
+        language: 'en',
+        events: {
+          onText() {},
+          onToolStart() {},
+          onToolEnd() {},
+          onStatus: (text) => statuses.push(text),
+          async confirm() {
+            return true;
+          },
+        },
+      },
+    );
+
+    expect(requestBodies).toHaveLength(2);
+    expect(result.status).toBe('no-change');
+    expect(statuses.at(-1)).toContain('no applicable change');
+    expect(existsSync(path.join(projectDir, 'main.py'))).toBe(false);
   });
 
   it('nudges once when the model emits code without fences', async () => {
