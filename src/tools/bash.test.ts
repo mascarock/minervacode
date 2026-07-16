@@ -12,7 +12,7 @@ afterEach(async () => {
 
 describe('Bash tool', () => {
   it('returns stdout for successful commands', async () => {
-    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-bash-'));
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-bash-'));
     dirs.push(projectDir);
     await expect(
       bashTool.call({ command: 'node -e "console.log(42)"' }, { projectDir }),
@@ -20,7 +20,7 @@ describe('Bash tool', () => {
   });
 
   it('explains runaway output instead of leaking an internal error code', async () => {
-    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-bash-'));
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-bash-'));
     dirs.push(projectDir);
     await expect(
       bashTool.call(
@@ -32,7 +32,7 @@ describe('Bash tool', () => {
   });
 
   it('rejects failed commands so the agent can fix failed tests', async () => {
-    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-bash-'));
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-bash-'));
     dirs.push(projectDir);
     await expect(
       bashTool.call(

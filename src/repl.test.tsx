@@ -29,7 +29,7 @@ function mockClient(responses: string[]): MinervaClient {
 
 describe('runChatOnce', () => {
   it('returns false when a fix request completes without an applicable change', async () => {
-    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-once-'));
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-once-'));
     dirs.push(projectDir);
     await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -45,7 +45,7 @@ describe('runChatOnce', () => {
   });
 
   it('reverts the run and reports failure when verification never passes', async () => {
-    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-once-'));
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-once-'));
     dirs.push(projectDir);
     await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -64,7 +64,7 @@ describe('runChatOnce', () => {
   });
 
   it('rollback also removes an EMPTY file the failed run created', async () => {
-    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-once-'));
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-once-'));
     dirs.push(projectDir);
     await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -87,7 +87,7 @@ describe('runChatOnce', () => {
   });
 
   it('reverts on turn-limit even when checks passed along the way', async () => {
-    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-once-'));
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-once-'));
     dirs.push(projectDir);
     await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -113,7 +113,7 @@ describe('runChatOnce', () => {
   });
 
   it('treats a completed run with no applicable verifier as success', async () => {
-    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-once-'));
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-once-'));
     dirs.push(projectDir);
     vi.spyOn(console, 'log').mockImplementation(() => {});
 
@@ -134,7 +134,7 @@ describe('runChatOnce', () => {
   });
 
   it('returns true for a verified run and keeps the changes', async () => {
-    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-once-'));
+    const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-once-'));
     dirs.push(projectDir);
     await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
     vi.spyOn(console, 'log').mockImplementation(() => {});

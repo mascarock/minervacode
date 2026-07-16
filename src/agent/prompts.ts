@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { Tool } from '../tools/tool.js';
 import { discoverProjectFiles, isSensitiveProjectFile } from './repo-map.js';
 
-export const PROJECT_CONTEXT_FILE = '.minervacli.md';
+export const PROJECT_CONTEXT_FILE = '.minervacode.md';
 
 const MAX_INJECT_FILES = 12;
 const MAX_INJECT_CANDIDATES = 32;

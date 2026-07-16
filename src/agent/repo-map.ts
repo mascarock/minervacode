@@ -17,7 +17,7 @@ const SKIP_DIRS = new Set([
   '.hg',
   '.svn',
   '.idea',
-  '.minervacli',
+  '.minervacode',
   '.vscode',
   '.venv',
   'venv',

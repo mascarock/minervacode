@@ -24,7 +24,7 @@ afterEach(async () => {
 });
 
 async function tempProject(): Promise<string> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-verify-'));
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-verify-'));
   dirs.push(dir);
   return dir;
 }
@@ -35,14 +35,14 @@ describe('detectVerifyCommand', () => {
     expect(requestRequiresExecution('Write calc.py, run it, then run the tests.')).toBe(true);
   });
 
-  it('prefers the Test command from .minervacli.md', async () => {
+  it('prefers the Test command from .minervacode.md', async () => {
     const dir = await tempProject();
     await writeFile(
-      path.join(dir, '.minervacli.md'),
+      path.join(dir, '.minervacode.md'),
       '# Project\n\n- Run: `python main.py`\n- Test: `python -m pytest -q tests/`\n',
     );
     const cmd = await detectVerifyCommand(dir, ['main.py'], ['main.py']);
-    expect(cmd).toEqual({ command: 'python -m pytest -q tests/', source: '.minervacli.md' });
+    expect(cmd).toEqual({ command: 'python -m pytest -q tests/', source: '.minervacode.md' });
   });
 
   it('uses the package.json test script when real', async () => {

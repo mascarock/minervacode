@@ -63,7 +63,7 @@ async function scaffoldProjectContext(projectDir: string): Promise<void> {
 }
 
 program
-  .name('minervacli')
+  .name('minervacode')
   .description(
     'Terminal chat client and assisted coding companion for Chat Minerva (Minerva 7B). ' +
       'Best used interactively: it proposes changes, you approve them, and the CLI verifies the result.',

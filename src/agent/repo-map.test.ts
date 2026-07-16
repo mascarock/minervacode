@@ -13,7 +13,7 @@ import {
 const dirs: string[] = [];
 
 async function tempProject(): Promise<string> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-repomap-'));
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-repomap-'));
   dirs.push(dir);
   return dir;
 }

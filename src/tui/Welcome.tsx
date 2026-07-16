@@ -8,7 +8,7 @@ export function Welcome({ info, extra = [] }: { info: SessionInfo; extra?: strin
   return (
     <Box flexDirection="column">
       <Text>
-        <Text color={ACCENT}>✻</Text> <Text bold>Welcome to Minerva CLI v{CLI_VERSION}</Text>
+        <Text color={ACCENT}>✻</Text> <Text bold>Welcome to MinervaCode v{CLI_VERSION}</Text>
       </Text>
       <Box flexDirection="column" marginTop={1} marginLeft={2}>
         {[...sessionInfoLines(info), ...extra].map((line) => (

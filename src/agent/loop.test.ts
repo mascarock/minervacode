@@ -30,7 +30,7 @@ function sseResponse(text: string): Response {
 }
 
 async function tempProject(): Promise<string> {
-  const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-loop-'));
+  const projectDir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-loop-'));
   dirs.push(projectDir);
   return projectDir;
 }

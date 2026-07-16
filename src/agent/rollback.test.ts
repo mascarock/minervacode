@@ -12,7 +12,7 @@ afterEach(async () => {
 });
 
 async function tempProject(): Promise<string> {
-  const dir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-rollback-'));
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-rollback-'));
   dirs.push(dir);
   return dir;
 }

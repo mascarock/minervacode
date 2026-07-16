@@ -9,7 +9,7 @@ const execFileAsync = promisify(execFile);
 
 export interface VerifyCommand {
   command: string;
-  /** Where the command came from, e.g. `.minervacli.md` or `pytest files`. */
+  /** Where the command came from, e.g. `.minervacode.md` or `pytest files`. */
   source: string;
   /** Optional shorter timeout for directly executed smoke-test programs. */
   timeoutMs?: number;
@@ -426,7 +426,7 @@ export function undefinedNameCheckCommand(changedPaths: string[]): VerifyCommand
 
 /**
  * Picks the command the harness runs to verify the agent's file changes.
- * Priority: explicit Test command in .minervacli.md, then the project's
+ * Priority: explicit Test command in .minervacode.md, then the project's
  * test setup, then a syntax check of the changed files.
  */
 export async function detectVerifyCommand(
@@ -469,7 +469,7 @@ export async function detectVerifyCommand(
   if (cSources.length && executeNamedProgram && cSources.some((p) => requestNamesPath(request, p))) {
     const input = numberedInputPipe(request);
     return {
-      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacli-c.XXXXXX") && trap 'rm -f "$bin"' EXIT && cc -std=c11 -Wall -Wextra -pedantic ${cSources.map(quote).join(' ')} -o "$bin" -lm && ${input ? `${input} | ` : ''}"$bin"`,
+      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacode-c.XXXXXX") && trap 'rm -f "$bin"' EXIT && cc -std=c11 -Wall -Wextra -pedantic ${cSources.map(quote).join(' ')} -o "$bin" -lm && ${input ? `${input} | ` : ''}"$bin"`,
       source: 'compile and run',
       timeoutMs: 10_000,
     };
@@ -481,7 +481,7 @@ export async function detectVerifyCommand(
   ) {
     const input = numberedInputPipe(request);
     return {
-      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacli-cpp.XXXXXX") && trap 'rm -f "$bin"' EXIT && c++ -std=c++17 -Wall -Wextra -pedantic ${cppSources.map(quote).join(' ')} -o "$bin" && ${input ? `${input} | ` : ''}"$bin"`,
+      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacode-cpp.XXXXXX") && trap 'rm -f "$bin"' EXIT && c++ -std=c++17 -Wall -Wextra -pedantic ${cppSources.map(quote).join(' ')} -o "$bin" && ${input ? `${input} | ` : ''}"$bin"`,
       source: 'compile and run',
       timeoutMs: 10_000,
     };
@@ -607,7 +607,7 @@ export async function detectVerifyCommand(
   }
   if (cSources.length && requestRequiresExecution(request)) {
     return {
-      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacli-c.XXXXXX") && trap 'rm -f "$bin"' EXIT && cc -std=c11 -Wall -Wextra -pedantic ${cSources.map(quote).join(' ')} -o "$bin" -lm && "$bin"`,
+      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacode-c.XXXXXX") && trap 'rm -f "$bin"' EXIT && cc -std=c11 -Wall -Wextra -pedantic ${cSources.map(quote).join(' ')} -o "$bin" -lm && "$bin"`,
       source: 'compile and run',
       timeoutMs: 10_000,
     };
@@ -621,7 +621,7 @@ export async function detectVerifyCommand(
   }
   if (cppSources.length && requestRequiresExecution(request)) {
     return {
-      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacli-cpp.XXXXXX") && trap 'rm -f "$bin"' EXIT && c++ -std=c++17 -Wall -Wextra -pedantic ${cppSources.map(quote).join(' ')} -o "$bin" && "$bin"`,
+      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacode-cpp.XXXXXX") && trap 'rm -f "$bin"' EXIT && c++ -std=c++17 -Wall -Wextra -pedantic ${cppSources.map(quote).join(' ')} -o "$bin" && "$bin"`,
       source: 'compile and run',
       timeoutMs: 10_000,
     };

@@ -53,7 +53,7 @@ describe('per-turn project context', () => {
   });
 
   it('bounds failed file injection so large repositories cannot recreate an oversized prompt', async () => {
-    const dir = await mkdtemp(path.join(os.tmpdir(), 'minervacli-prompts-'));
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'minervacode-prompts-'));
     try {
       const paths: string[] = [];
       for (let i = 0; i < 50; i++) {

@@ -425,7 +425,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   let initialVerification: { command: string; output: string } | undefined;
   if (auto && firstTurn && requestExpectsChanges(prompt)) {
     const cmd = await detectVerifyCommand(opts.projectDir, projectFiles, []);
-    if (cmd && /test|pytest|unittest|\.minervacli\.md/i.test(cmd.source)) {
+    if (cmd && /test|pytest|unittest|\.minervacode\.md/i.test(cmd.source)) {
       const bash = getTool('Bash');
       const event: ToolCallEvent | null = bash
         ? { tool: bash, input: { command: cmd.command }, summary: compactCommand(cmd.command) }

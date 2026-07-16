@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { MinervaConfig } from '../types.js';
 
-export const CONFIG_DIR = join(homedir(), '.minervacli');
+export const CONFIG_DIR = join(homedir(), '.minervacode');
 export const CONFIG_PATH = join(CONFIG_DIR, 'config.json');
 
 export const DEFAULT_BASE_URL = process.env.MINERVA_BASE_URL ?? 'https://chatminerva.org';
