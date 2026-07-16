@@ -19,6 +19,7 @@ import {
   countedSortMismatch,
   countdownMismatch,
   degenerateSequenceOutput,
+  fizzBuzzMismatch,
   detectVerifyCommand,
   primeSequenceMismatch,
   requestRequiresExecution,
@@ -308,10 +309,6 @@ const ACTION_CLAIM =
 
 /** The model hallucinates a web UI ("click the Show Code button"). */
 const UI_CLAIM = /\b(?:show\s+code|pulsante|button|click\w*|clicc\w*)\b/i;
-
-/** The model refuses, wrongly claiming it cannot write files or run code. */
-const CAPABILITY_REFUSAL =
-  /\b(?:(?:i\s+am|i'm)\s+(?:unable|not able)\s+to|i\s+can(?:no|')t|non\s+(?:posso|sono in grado di))\s+(?:perform|write|creat\w*|run|execut\w*|modif\w*|access|scriv\w*|cre\w*|esegu\w*)/i;
 
 /** Code structure in plain text — the model forgot the fences entirely. */
 const UNFENCED_CODE =
@@ -608,7 +605,8 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       (threeNumberArithmeticMismatch(prompt, raw.output) ||
         threeNumberMinimumSumMismatch(prompt, raw.output) ||
         countedSortMismatch(prompt, raw.output) ||
-        countdownMismatch(prompt, raw.output));
+        countdownMismatch(prompt, raw.output) ||
+        fizzBuzzMismatch(prompt, raw.output));
     const ok = degenerate || wrongPrimeSequence || wrongProgramOutput ? false : raw.ok;
     const output = degenerate
       ? `${raw.output}\n\n[verification] The program ran but its output is the same number repeated — a "first N" sequence must have distinct terms. Fix the generator so it advances between terms.`
@@ -708,18 +706,17 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     }
 
     if (!toolCalls.length) {
-      // The model showed code fences (or claims it changed something)
-      // but nothing was applied — restate the format once, don't give up.
+      // Preserve explicit malformed-output signals even for terse requests
+      // ("Set y", "Bump config") that the intent classifier may not catch.
+      // UI hallucinations also take precedence over the question detector:
+      // "If you want, click Show Code" is not a real clarification.
       if (
         !nudged &&
         !changes.length &&
         (response.includes('```') ||
           ACTION_CLAIM.test(response) ||
           UI_CLAIM.test(response) ||
-          // Refusals and fence-less code only warrant a retry when the
-          // request actually asked for a change.
-          (requestExpectsChanges(prompt) &&
-            (CAPABILITY_REFUSAL.test(response) || UNFENCED_CODE.test(response))))
+          (requestExpectsChanges(prompt) && UNFENCED_CODE.test(response)))
       ) {
         nudged = true;
         messages.push({
@@ -743,6 +740,20 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         messages.push({
           role: 'user',
           content: `Yes. Do not ask further questions — proceed with your best interpretation now. Emit the complete file: the filename on its own line, then one fenced code block with the COMPLETE contents.\nOriginal request: ${prompt}`,
+        });
+        continue;
+      }
+
+      // Classify failure structurally, not by refusal wording. Any mutating
+      // request that produced neither a tool call nor an applied fallback
+      // gets one corrected-format retry. This catches generic apologies,
+      // empty/prose-only replies, and unrecognized malformed output in every
+      // language without an open-ended list of refusal phrases.
+      if (!nudged && !changes.length && requestExpectsChanges(prompt)) {
+        nudged = true;
+        messages.push({
+          role: 'user',
+          content: formatNudge(projectFiles, requiredNewPaths),
         });
         continue;
       }

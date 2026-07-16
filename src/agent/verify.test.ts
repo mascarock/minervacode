@@ -7,6 +7,7 @@ import {
   primeSequenceMismatch,
   countedSortMismatch,
   countdownMismatch,
+  fizzBuzzMismatch,
   detectVerifyCommand,
   requestRequiresExecution,
   runVerification,
@@ -628,6 +629,31 @@ describe('countdownMismatch', () => {
 
   it('accepts the exact requested descending sequence', () => {
     expect(countdownMismatch(request, '10\n9\n8\n7\n6\n5\n4\n3\n2\n1')).toBe(false);
+  });
+
+  it('matches "counts down" phrasing without requiring the filename', () => {
+    const countsDown = 'Write countdown.py that counts down from 10 to 1, printing each number.';
+    expect(countdownMismatch(countsDown, '0')).toBe(true);
+    expect(countdownMismatch(countsDown, '10\n9\n8\n7\n6\n5\n4\n3\n2\n1')).toBe(false);
+  });
+});
+
+describe('fizzBuzzMismatch', () => {
+  const request = 'Scrivi fizzbuzz.py che stampa FizzBuzz da 1 a 30.';
+
+  it('rejects a stub that prints only the title once', () => {
+    expect(fizzBuzzMismatch(request, 'FizzBuzz')).toBe(true);
+  });
+
+  it('accepts the full requested sequence', () => {
+    const lines = Array.from({ length: 30 }, (_, index) => {
+      const n = index + 1;
+      if (n % 15 === 0) return 'FizzBuzz';
+      if (n % 3 === 0) return 'Fizz';
+      if (n % 5 === 0) return 'Buzz';
+      return String(n);
+    });
+    expect(fizzBuzzMismatch(request, lines.join('\n'))).toBe(false);
   });
 });
 
