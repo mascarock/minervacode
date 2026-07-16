@@ -9,6 +9,8 @@ export interface ParsedToolCall {
   raw: string;
   /** Which parser layer produced the call. */
   source: ToolCallSource;
+  /** This Write came from a fence the model never closed — likely a half file. */
+  suspectTruncated?: boolean;
 }
 
 export interface ParseResult {
@@ -348,6 +350,7 @@ function parseCodeBlockLayer(
   preferredFiles?: string[],
   guessPreferredFile = false,
   fallbackNewFile = false,
+  truncatedFenceIndex = -1,
 ): ParsedToolCall[] {
   const calls: ParsedToolCall[] = [];
   for (const match of response.matchAll(CODE_BLOCK)) {
@@ -459,11 +462,15 @@ function parseCodeBlockLayer(
     const canonical = canonicalKnownPath(path, knownFiles);
     if (canonical === null) continue; // ambiguous — let the nudge ask for a full path
 
+    // Only the Write produced from the auto-closed trailing fence is
+    // suspect — never an earlier, complete write in the same reply.
+    const suspectTruncated = truncatedFenceIndex >= 0 && (match.index ?? 0) >= truncatedFenceIndex;
     calls.push({
       tool: 'Write',
       args: { path: canonical, content: body },
       raw,
       source: 'codeblock',
+      ...(suspectTruncated ? { suspectTruncated: true } : {}),
     });
   }
   return calls;
@@ -473,13 +480,29 @@ function parseCodeBlockLayer(
  * Closes a trailing fence the model never closed (it stopped generating or
  * rambled off). Without this the final — often only — code block is lost.
  */
-function closeUnfinishedFence(response: string): { text: string; closed: boolean } {
+function closeUnfinishedFence(response: string): {
+  text: string;
+  closed: boolean;
+  openerIndex: number;
+} {
   const delimiters = response.match(/```/g)?.length ?? 0;
-  if (delimiters % 2 === 0) return { text: response, closed: false };
-  // Only a fence that actually started content can be closed meaningfully.
+  if (delimiters % 2 === 0) return { text: response, closed: false, openerIndex: -1 };
   const last = response.lastIndexOf('```');
-  if (!response.slice(last).includes('\n')) return { text: response, closed: false };
-  return { text: `${response.replace(/\n?$/, '\n')}\`\`\``, closed: true };
+  // A genuine unclosed opener starts its own line (≤3 spaces indent) and is
+  // followed by only an optional info token then a newline with content. A
+  // stray ``` mid-prose ("wrap it in ``` fences") flips parity but is NOT an
+  // opener — closing after it would wrongly flag the earlier complete block.
+  const lineStart = response.lastIndexOf('\n', last) + 1;
+  if (/[^ ]/.test(response.slice(lineStart, last))) {
+    return { text: response, closed: false, openerIndex: -1 };
+  }
+  const afterFence = response.slice(last + 3);
+  const newline = afterFence.indexOf('\n');
+  if (newline === -1) return { text: response, closed: false, openerIndex: -1 };
+  if (!/^[^\s`]*[^\S\n]*$/.test(afterFence.slice(0, newline))) {
+    return { text: response, closed: false, openerIndex: -1 };
+  }
+  return { text: `${response.replace(/\n?$/, '\n')}\`\`\``, closed: true, openerIndex: last };
 }
 
 export function parseToolCalls(response: string, options: ParseOptions = {}): ParseResult {
@@ -501,6 +524,7 @@ export function parseToolCalls(response: string, options: ParseOptions = {}): Pa
       options.preferredFiles,
       options.guessPreferredFile,
       options.fallbackNewFile,
+      repaired.openerIndex,
     );
     calls.push(...junk.map((c) => ({ ...c, args: {} })));
   }
@@ -511,5 +535,7 @@ export function parseToolCalls(response: string, options: ParseOptions = {}): Pa
   }
   text = text.replaceAll(/\n{3,}/g, '\n\n').trim();
 
-  return { toolCalls: calls, text, suspectTruncated: repaired.closed };
+  // Reply-wide flag stays true only when the auto-closed fence actually
+  // produced a Write — a trailing prose/no-filename fence flags nothing.
+  return { toolCalls: calls, text, suspectTruncated: calls.some((c) => c.suspectTruncated) };
 }

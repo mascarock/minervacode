@@ -284,6 +284,71 @@ describe('pending intent across turns', () => {
   });
 });
 
+describe('semantic false-success guard (t07-style)', () => {
+  it('does not report a degenerate prime sequence as verified', async () => {
+    const projectDir = await tempProject();
+    // Broken generator: resets num=2 every iteration → appends 2 forever.
+    const broken = [
+      'primes = []',
+      'while len(primes) < 20:',
+      '    num = 2',
+      '    while True:',
+      '        primes.append(num)',
+      '        break',
+      'print(primes)',
+      '',
+    ].join('\n');
+    const responses = [
+      `Updated \`main.py\`:\n\n\`\`\`python\n${broken}\`\`\``,
+      'It prints twenty 2s.',
+      'Still the same.',
+      'Cannot fix.',
+    ];
+    const result = await runAgent(mockClient(responses), {
+      history: [],
+      prompt: 'Write main.py that prints the first 20 prime numbers.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    // The program runs and prints, but it must NOT be reported verified.
+    expect(result.verified).not.toBe(true);
+  }, 30_000);
+});
+
+describe('semantic false-success guard (t03-style)', () => {
+  it('does not verify a program that reads one number instead of three', async () => {
+    const projectDir = await tempProject();
+    const broken = [
+      'numbers = []',
+      'while True:',
+      '    numbers.append(int(input("Numero: ")))',
+      '    break',
+      'print("Il più piccolo è", min(numbers))',
+      '',
+    ].join('\n');
+    const responses = [
+      `Updated \`main.py\`:\n\n\`\`\`python\n${broken}\`\`\``,
+      'It reads one number.',
+      'Still the same.',
+      'Cannot fix.',
+    ];
+    const result = await runAgent(mockClient(responses), {
+      history: [],
+      prompt:
+        "Chiedi all'utente di inserire tre numeri, dopodiché verifica qual è il più piccolo e sommali.",
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'it',
+      events: autoEvents(),
+    });
+
+    expect(result.verified).not.toBe(true);
+  }, 30_000);
+});
+
 describe('no-op write breaker', () => {
   const identicalWrite = (content: string) =>
     `<minerva_tool name="Write">\n<path>main.py</path>\n<content>\n${content}</content>\n</minerva_tool>`;
@@ -611,6 +676,83 @@ describe('autonomous agent loop', () => {
       'for i in range(5, 0, -1):\n    print(i)\n',
     );
     expect(result.status).toBe('completed');
+    expect(result.verified).toBe(true);
+  });
+
+  it('uses a compact, file-grounded prompt for a failed autonomous repair', async () => {
+    const projectDir = await tempProject();
+    const requestBodies: unknown[] = [];
+    const responses = [
+      'Updated `answer.py`:\n\n```python\nprint(missing_name)\n```',
+      'Updated `answer.py`:\n\n```python\nprint("fixed")\n```',
+      'Done.',
+    ];
+
+    const result = await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Create answer.py that prints fixed and run it.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      review: false,
+      events: autoEvents(),
+    });
+
+    const repairRequest = JSON.stringify(requestBodies[1]);
+    expect(repairRequest).toContain('Return exactly one complete replacement file');
+    expect(repairRequest).toContain('print(missing_name)');
+    expect(repairRequest).not.toContain('Use the tools below to read files');
+    expect(result.status).toBe('completed');
+    expect(result.verified).toBe(true);
+  });
+
+  it('does not leak Python input-probe implementation into a repair prompt', async () => {
+    const projectDir = await tempProject();
+    const requestBodies: unknown[] = [];
+    const responses = [
+      'Updated `main.py`:\n\n```python\nprint(missing_name)\n```',
+      'Updated `main.py`:\n\n```python\nprint(sum(map(int, input().split())))\n```',
+      'Done.',
+    ];
+
+    const result = await runAgent(mockClient(responses, requestBodies), {
+      history: [],
+      prompt: 'Create main.py, ask the user for three integers, print their sum, and run it.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      review: false,
+      events: autoEvents(),
+    });
+
+    const repairRequest = JSON.stringify(requestBodies[1]);
+    expect(repairRequest).toContain("python3 -m py_compile 'main.py' && python3 - 'main.py'");
+    expect(repairRequest).not.toContain('class ProbeInput(str)');
+    expect(await readFile(path.join(projectDir, 'main.py'), 'utf-8')).toContain('sum(map(int');
+    expect(result.verified).toBe(true);
+    expect(result.verification?.command).toContain('…');
+    expect(result.verification?.command).not.toContain('class ProbeInput');
+  });
+
+  it('allows a file created this run to be rewritten when its path spelling changes', async () => {
+    const projectDir = await tempProject();
+    const responses = [
+      'Updated `./main.py`:\n\n```python\ndef obsolete():\n    return 0\n\nprint(missing_name)\n```',
+      'Updated `main.py`:\n\n```python\nprint("fixed")\n```',
+      'Done.',
+    ];
+
+    const result = await runAgent(mockClient(responses), {
+      history: [],
+      prompt: 'Create main.py that prints fixed and run it.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      review: false,
+      events: autoEvents(),
+    });
+
+    expect(await readFile(path.join(projectDir, 'main.py'), 'utf-8')).toBe('print("fixed")\n');
     expect(result.verified).toBe(true);
   });
 

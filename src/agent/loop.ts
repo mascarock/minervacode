@@ -16,9 +16,15 @@ import { buildPreview, filePatch, readIfExists } from './preview.js';
 import type { NetChange } from './rollback.js';
 import { runReview } from './review.js';
 import {
+  countedSortMismatch,
+  countdownMismatch,
+  degenerateSequenceOutput,
   detectVerifyCommand,
+  primeSequenceMismatch,
   requestRequiresExecution,
   runVerification,
+  threeNumberArithmeticMismatch,
+  threeNumberMinimumSumMismatch,
   syntaxCheckCommand,
   undefinedNameCheckCommand,
 } from './verify.js';
@@ -519,12 +525,15 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         }
       }),
     );
+    // A failing response is the moment a 7B most needs LESS context. The
+    // full agent prompt is useful for discovery, but replaying its long rule
+    // list alongside a traceback made the model narrate repairs or preserve
+    // its broken abstraction. Rebuild a one-shot, file-grounded replacement
+    // request instead: the parser applies the labelled fence deterministically.
     messages = [
-      { role: 'user', content: instructions },
-      { role: 'assistant', content: AGENT_ACKNOWLEDGEMENT },
       {
         role: 'user',
-        content: `${languageInstruction(opts.language)}\n\nFocused autonomous repair.\nOriginal student request: ${prompt}\n${requiredNewPaths.length ? `Required output path: ${requiredNewPaths.join(', ')}\n` : ''}The current source below failed a REAL verification command. Fix the actual error or timeout with the simplest complete implementation. Emit the Write/Edit action first, with no tutorial and no partial snippets.\n\n${currentFiles.join('\n\n')}\n\nVerification failure:\n$ ${command}\n${output}`,
+        content: `${languageInstruction(opts.language)}\n\nRepair the current source file now. Return exactly one complete replacement file, with the filename on its own line immediately before one fenced code block. Do not explain, apologize, ask a question, show commands, or include partial snippets. For a small standalone program, prefer simple top-level code and standard-library features.\n\nOriginal student request: ${prompt}\n${requiredNewPaths.length ? `Required output path: ${requiredNewPaths.join(', ')}\n` : ''}\nCurrent source (authoritative):\n${currentFiles.join('\n\n')}\n\nReal verification failure:\n$ ${command}\n${output}`,
       },
     ];
   };
@@ -580,11 +589,40 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       : null;
     opts.events.onStatus?.(`Verifying changes (${cmd.source}): ${compactCommand(cmd.command)}`);
     if (event) opts.events.onToolStart(event);
-    const { ok, output } = await runVerification(cmd, opts.projectDir, opts.signal);
+    const raw = await runVerification(cmd, opts.projectDir, opts.signal);
+    // A compile-and-run pass proves the program runs, NOT that it is
+    // correct. For distinct-sequence tasks a collapse to one repeated
+    // value ("first 20 primes" → twenty 2s) is a broken generator that the
+    // exit code cannot see — treat that specific pass as a failure.
+    const degenerate =
+      raw.ok &&
+      cmd.source === 'compile and run' &&
+      degenerateSequenceOutput(prompt, raw.output);
+    const wrongPrimeSequence =
+      raw.ok &&
+      cmd.source === 'compile and run' &&
+      primeSequenceMismatch(prompt, raw.output);
+    const wrongProgramOutput =
+      raw.ok &&
+      cmd.source === 'compile and run' &&
+      (threeNumberArithmeticMismatch(prompt, raw.output) ||
+        threeNumberMinimumSumMismatch(prompt, raw.output) ||
+        countedSortMismatch(prompt, raw.output) ||
+        countdownMismatch(prompt, raw.output));
+    const ok = degenerate || wrongPrimeSequence || wrongProgramOutput ? false : raw.ok;
+    const output = degenerate
+      ? `${raw.output}\n\n[verification] The program ran but its output is the same number repeated — a "first N" sequence must have distinct terms. Fix the generator so it advances between terms.`
+      : wrongPrimeSequence
+        ? `${raw.output}\n\n[verification] The program ran, but it did not print the requested first prime numbers in order. Generate prime values starting at 2; do not print ordinary counting numbers.`
+      : wrongProgramOutput
+        ? `${raw.output}\n\n[verification] The program ran, but its output did not satisfy the requested result. Read the requested behavior again and produce every required value in the correct order.`
+      : raw.output;
     if (event) opts.events.onToolEnd({ ...event, ok, result: output });
 
     verifyState.last = ok;
-    verifyState.evidence = { command: cmd.command, output, source: cmd.source, ok };
+    // The evidence shown to students should identify what ran without
+    // dumping internal here-doc probe machinery into their transcript.
+    verifyState.evidence = { command: compactCommand(cmd.command), output, source: cmd.source, ok };
     lastVerifySerial = changeSerial;
     // Only a passing check clears the dirty set — a failed one stays due
     // so the stop-branch retries after the model's next fix attempt.
@@ -604,13 +642,16 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         stuckOnIdenticalError = true;
         return true;
       }
-      await focusFailedRepair(cmd.command, output);
+      // Multi-line verification commands can contain harness implementation
+      // (for example the Python input probe). Never let a weak model mistake
+      // that machinery for source it should paste into the student's file.
+      await focusFailedRepair(compactCommand(cmd.command), output);
     }
     const guidance = ok
       ? 'Verification passed. If the request is complete, briefly summarize what you changed — do not repeat file contents.'
       : `This verification command failed. Use the REAL error output above and apply a source fix now — do not merely explain it, do not weaken tests, and do not send partial snippets.${requiredNewPaths.length ? ` Replace the required ${requiredNewPaths.join(', ')} with a complete minimal implementation when a whole-file rewrite is needed.` : ''} The check will run again only after a file changes.`;
     results.push(
-      `${formatToolResult('Bash', `$ ${cmd.command}\n${output}`, ok)}\n\n${guidance}`,
+      `${formatToolResult('Bash', `$ ${compactCommand(cmd.command)}\n${output}`, ok)}\n\n${guidance}`,
     );
     return true;
   };
@@ -857,10 +898,10 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     const assistedCodeblockOnly =
       !auto && toolCalls.every((c) => c.source === 'codeblock');
 
-    // The auto-closed final fence may hold half a file: its Write is the
-    // one produced from that fence (the last code-block Write).
+    // The parser tags the exact Write produced from the auto-closed fence;
+    // an earlier complete write in the same reply is never blamed.
     const truncatedCall = suspectTruncated
-      ? [...toolCalls].reverse().find((c) => c.source === 'codeblock' && c.tool === 'Write')
+      ? toolCalls.find((c) => c.suspectTruncated)
       : undefined;
 
     for (const call of toolCalls.slice(0, MAX_CALLS_PER_TURN)) {
@@ -1008,10 +1049,12 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       // protects the STUDENT's pre-existing work. A file this run created
       // has none — merging or refusing there only traps the model with its
       // own broken first draft instead of letting it rewrite cleanly.
-      const netEntry =
-        typeof input.path === 'string'
-          ? netState.get(input.path) ?? netState.get(input.path.replace(/^\.\//, ''))
-          : undefined;
+      const normalizedNetPath =
+        typeof input.path === 'string' ? input.path.replace(/^\.\//, '') : null;
+      const netEntry = normalizedNetPath
+        ? netState.get(normalizedNetPath) ??
+          netState.get(`./${normalizedNetPath}`)
+        : undefined;
       const createdThisRun = netEntry?.existedBefore === false;
 
       // A code-block "file" that only re-states some existing functions is

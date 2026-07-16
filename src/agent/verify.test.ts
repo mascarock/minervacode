@@ -3,9 +3,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  degenerateSequenceOutput,
+  primeSequenceMismatch,
+  countedSortMismatch,
+  countdownMismatch,
   detectVerifyCommand,
   requestRequiresExecution,
   runVerification,
+  threeNumberArithmeticMismatch,
+  threeNumberMinimumSumMismatch,
   syntaxCheckCommand,
   undefinedNameCheckCommand,
 } from './verify.js';
@@ -287,6 +293,51 @@ describe('detectVerifyCommand', () => {
     expect(result).toEqual({ ok: true, output: 'hi' });
   });
 
+  it('feeds a repeated-input three-number program a compatible fixture when it runs', async () => {
+    const dir = await tempProject();
+    await writeFile(
+      path.join(dir, 'main.py'),
+      'a = int(input())\nb = int(input())\nc = int(input())\nprint(a + b + c)\n',
+    );
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['main.py'],
+      ['main.py'],
+      undefined,
+      'Create main.py, ask the user for three integers, print their sum, and run it.',
+    );
+    expect(cmd?.command).toContain('class ProbeInput(str)');
+    expect(await runVerification(cmd!, dir)).toEqual({ ok: true, output: '15' });
+  });
+
+  it('feeds all three values to an input().split() three-number program', async () => {
+    const dir = await tempProject();
+    await writeFile(path.join(dir, 'main.py'), 'print(sum(map(int, input().split())))\n');
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['main.py'],
+      ['main.py'],
+      undefined,
+      'Create main.py, ask the user for three integers, print their sum, and run it.',
+    );
+    expect(cmd?.command).toContain('class ProbeInput(str)');
+    expect(await runVerification(cmd!, dir)).toEqual({ ok: true, output: '15' });
+  });
+
+  it('feeds every requested value to a five-number input program', async () => {
+    const dir = await tempProject();
+    await writeFile(path.join(dir, 'main.py'), 'print(*sorted(map(int, input().split())))\n');
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['main.py'],
+      ['main.py'],
+      undefined,
+      'Create main.py, ask the user for five integers, sort them, print them, and run it.',
+    );
+    expect(cmd?.command).toContain('class ProbeInput(str)');
+    expect(await runVerification(cmd!, dir)).toEqual({ ok: true, output: '1 2 4 7 9' });
+  });
+
   it('runs an explicitly named script before an unrelated package test', async () => {
     const dir = await tempProject();
     await writeFile(
@@ -411,6 +462,172 @@ describe('undefinedNameCheckCommand', () => {
     const { ok, output } = await runVerification(cmd!, dir);
     expect(output).not.toContain('possibly undefined');
     expect(ok).toBe(true);
+  });
+
+  it('does not flag multi-generator comprehensions (matrix flatten idiom)', async () => {
+    const dir = await tempProject();
+    await writeFile(
+      path.join(dir, 'main.py'),
+      [
+        'matrix = [[1, 2], [3, 4]]',
+        'flat = [x for row in matrix for x in row]',
+        'pairs = {k: v for k in [1, 2] for v in range(k)}',
+        'nested = [x for sub in ([[1]]) for row in sub for x in row]',
+        'print(flat, pairs, nested)',
+        '',
+      ].join('\n'),
+    );
+    const { ok, output } = await runVerification(undefinedNameCheckCommand(['main.py'])!, dir);
+    expect(output).not.toContain('possibly undefined');
+    expect(ok).toBe(true);
+  });
+
+  it('does not flag a name bound via global read at module level or another function', async () => {
+    const dir = await tempProject();
+    await writeFile(
+      path.join(dir, 'main.py'),
+      [
+        'def setup():',
+        '    global CONFIG',
+        '    CONFIG = 42',
+        'def use():',
+        '    return CONFIG',
+        'setup()',
+        'print(CONFIG, use())',
+        '',
+      ].join('\n'),
+    );
+    const { ok, output } = await runVerification(undefinedNameCheckCommand(['main.py'])!, dir);
+    expect(output).not.toContain('possibly undefined');
+    expect(ok).toBe(true);
+  });
+
+  it('still flags a genuinely undefined name inside a function', async () => {
+    const dir = await tempProject();
+    await writeFile(
+      path.join(dir, 'main.py'),
+      ['def f():', '    return undefined_var + 1', 'print(f())', ''].join('\n'),
+    );
+    const { ok, output } = await runVerification(undefinedNameCheckCommand(['main.py'])!, dir);
+    expect(output).toContain("'undefined_var'");
+    expect(ok).toBe(false);
+  });
+});
+
+describe('degenerateSequenceOutput', () => {
+  it('rejects the live t07 failure: first 20 primes emitting twenty 2s', () => {
+    const request = 'Extend main.py to print the first 20 prime numbers instead of 10.';
+    const output = 'The first 20 prime numbers are: ' + JSON.stringify(new Array(20).fill(2));
+    expect(degenerateSequenceOutput(request, output)).toBe(true);
+  });
+
+  it('accepts a correct prime sequence', () => {
+    const request = 'Write a script that prints the first 20 prime numbers.';
+    const output = '2 3 5 7 11 13 17 19 23 29 31 37 41 43 47 53 59 61 67 71';
+    expect(degenerateSequenceOutput(request, output)).toBe(false);
+  });
+
+  it('accepts a correct fibonacci sequence (leading 1,1 is fine)', () => {
+    const request = 'Print the first 10 Fibonacci numbers.';
+    const output = '1 1 2 3 5 8 13 21 34 55';
+    expect(degenerateSequenceOutput(request, output)).toBe(false);
+  });
+
+  it('does not fire on non-sequence programs even with repeated numbers', () => {
+    expect(degenerateSequenceOutput('Count down from 10 to 1.', '2 2 2 2 2')).toBe(false);
+    expect(degenerateSequenceOutput('Print a multiplication table.', '2 4 2 4 2 4')).toBe(false);
+  });
+
+  it('needs enough output tokens before judging', () => {
+    expect(degenerateSequenceOutput('first 20 primes', '2 2')).toBe(false);
+  });
+});
+
+describe('primeSequenceMismatch', () => {
+  it('rejects counting numbers for an explicit first-primes task', () => {
+    expect(
+      primeSequenceMismatch(
+        'Create primes.py that prints the first 10 prime numbers in order.',
+        'Prime numbers up to 10: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]',
+      ),
+    ).toBe(true);
+  });
+
+  it('accepts the exact first ten primes', () => {
+    expect(
+      primeSequenceMismatch(
+        'Create primes.py that prints the first 10 prime numbers in order.',
+        '2 3 5 7 11 13 17 19 23 29',
+      ),
+    ).toBe(false);
+  });
+});
+
+describe('threeNumberMinimumSumMismatch', () => {
+  const request =
+    "Chiedi all'utente di inserire tre numeri, dopodiché verifica qual è il più piccolo e sommali.";
+
+  it('rejects the live t03 failure: one input reported as the minimum with no sum', () => {
+    expect(
+      threeNumberMinimumSumMismatch(
+        request,
+        'I tuoi numeri sono: [9]\nIl più piccolo tra questi è: 9',
+      ),
+    ).toBe(true);
+  });
+
+  it('accepts the expected results for the deterministic three-value probe', () => {
+    expect(
+      threeNumberMinimumSumMismatch(request, 'Il più piccolo è 2\nLa somma è 15'),
+    ).toBe(false);
+  });
+
+  it('does not apply to unrelated numeric programs', () => {
+    expect(threeNumberMinimumSumMismatch('Print the sum of two numbers.', '3')).toBe(false);
+  });
+});
+
+describe('threeNumberArithmeticMismatch', () => {
+  it('rejects a three-number sum task that did not print the probe sum', () => {
+    expect(
+      threeNumberArithmeticMismatch(
+        'Ask the user for three integers and print their sum.',
+        'The sum is 9',
+      ),
+    ).toBe(true);
+  });
+
+  it('accepts the expected sum for the deterministic probe', () => {
+    expect(
+      threeNumberArithmeticMismatch(
+        'Ask the user for three integers and print their sum.',
+        'The sum is 15',
+      ),
+    ).toBe(false);
+  });
+});
+
+describe('countedSortMismatch', () => {
+  const request = 'Ask the user for five integers, sort them in ascending order, and print them.';
+
+  it('rejects output that did not sort all five probe values', () => {
+    expect(countedSortMismatch(request, '9 4 2 7 1')).toBe(true);
+  });
+
+  it('accepts ascending output for every probe value', () => {
+    expect(countedSortMismatch(request, '1 2 4 7 9')).toBe(false);
+  });
+});
+
+describe('countdownMismatch', () => {
+  const request = 'Create countdown.py that prints each integer from 10 down to 1, then run it.';
+
+  it('rejects the live failure that printed negative values', () => {
+    expect(countdownMismatch(request, '10\n-9\n-8\n-7\n-6\n-5\n-4\n-3\n-2\n-1')).toBe(true);
+  });
+
+  it('accepts the exact requested descending sequence', () => {
+    expect(countdownMismatch(request, '10\n9\n8\n7\n6\n5\n4\n3\n2\n1')).toBe(false);
   });
 });
 

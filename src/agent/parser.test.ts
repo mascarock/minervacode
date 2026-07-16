@@ -138,6 +138,52 @@ describe('parseToolCalls — code-block Write heuristic (assisted only)', () => 
     ).toBe(false);
   });
 
+  it('does not flag a complete write when a stray fence in prose flips parity', () => {
+    const F = '```';
+    const reply = [
+      'Updated `calc.py`:',
+      F + 'python',
+      'def add(a, b):',
+      '    return a + b',
+      F,
+      '',
+      'I wrapped it in ' + F + ' so you can paste it into your editor.',
+      'Let me know if you need anything else.',
+    ].join('\n');
+    const result = parseToolCalls(reply, { codeBlockWriteFallback: true, knownFiles: ['calc.py'] });
+    expect(result.suspectTruncated).toBe(false);
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({ tool: 'Write', args: { path: 'calc.py', content: 'def add(a, b):\n    return a + b\n' } }),
+    ]);
+  });
+
+  it('blames only the truncated fence, not an earlier complete write', () => {
+    const F = '```';
+    const reply = [
+      'Updated `calc.py`:',
+      F + 'python',
+      'print("a")',
+      F,
+      '',
+      'Updated `utils.py`:',
+      F + 'python',
+      'print("b")',
+      F,
+      '',
+      'And here is a bonus ' + F + 'python',
+      'x = broke',
+    ].join('\n');
+    const result = parseToolCalls(reply, {
+      codeBlockWriteFallback: true,
+      knownFiles: ['calc.py', 'utils.py'],
+    });
+    // The two complete writes are not suspect; the truncated bonus fence had
+    // no filename, so it produced no Write to flag.
+    const suspect = result.toolCalls.filter((c) => c.suspectTruncated);
+    expect(suspect).toEqual([]);
+    expect(result.toolCalls.map((c) => c.args.path)).toEqual(['calc.py', 'utils.py']);
+  });
+
   it('accepts a destination filename in the fence info string', () => {
     const response = '```primes.c\n#include <stdio.h>\nint main(void) { return 0; }\n```';
     const result = parseToolCalls(response, { codeBlockWriteFallback: true });

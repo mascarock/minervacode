@@ -21,6 +21,177 @@ export interface VerifyCommand {
 const EXPECTS_PRINTED_OUTPUT =
   /\b(?:print\w*|stamp\w*|output|display\w*|mostra\w*|visualizz\w*|greet\w*|salut\w*|count\w*|conta\w*)\b/i;
 
+/**
+ * Requests whose output is an inherently DISTINCT integer sequence — the
+ * first N primes or Fibonacci numbers. Deterministic verification cannot
+ * judge correctness in general, but for these a collapse to one repeated
+ * value is an unambiguous broken-generator signal (observed live: "first
+ * 20 primes" emitting twenty 2s, yet passing the compile-and-run gate).
+ */
+const DISTINCT_SEQUENCE_NOUN = /\b(?:primes?|prime numbers?|numeri primi|fibonacci)\b/i;
+const FIRST_PRIME_COUNT = /\b(?:first|primi)\s+(\d+)\s+(?:primes?|prime numbers?|numeri primi)\b/i;
+
+const THREE_NUMBER_REQUEST = /\b(?:three|3|tre)\s+(?:numbers?|integers?|numeri)\b/i;
+const MINIMUM_REQUEST = /\b(?:min(?:imum)?|smallest|pi[uù]\s+piccol\w*|minim\w*)\b/i;
+const SUM_REQUEST = /\b(?:sum|add|total|somm\w*)\b/i;
+const THREE_NUMBER_PROBE = [9, 4, 2] as const;
+const NUMBER_WORDS: Record<string, number> = {
+  one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  uno: 1, due: 2, tre: 3, quattro: 4, cinque: 5, sei: 6, sette: 7, otto: 8, nove: 9, dieci: 10,
+};
+const COUNTED_NUMBER_REQUEST = /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|uno|due|tre|quattro|cinque|sei|sette|otto|nove|dieci)\s+(?:numbers?|integers?|numeri)\b/i;
+const NUMBER_PROBE_VALUES = [9, 4, 2, 7, 1, 6, 3, 8, 5, 0] as const;
+
+/** Number of requested interactive integers, bounded to a small safe probe. */
+function requestedNumberCount(request: string): number | null {
+  const raw = request.match(COUNTED_NUMBER_REQUEST)?.[1]?.toLowerCase();
+  if (!raw) return null;
+  const count = /^\d+$/.test(raw) ? Number(raw) : NUMBER_WORDS[raw];
+  return Number.isInteger(count) && count >= 2 && count <= NUMBER_PROBE_VALUES.length
+    ? count
+    : null;
+}
+
+/**
+ * True when a distinct-sequence request produced output dominated by a
+ * single repeated number — sound (a correct sequence has distinct terms),
+ * and narrowly gated so it never fires on ordinary programs.
+ */
+export function degenerateSequenceOutput(request: string, output: string): boolean {
+  if (!DISTINCT_SEQUENCE_NOUN.test(request) || !/\d/.test(request)) return false;
+  const nums = output.match(/-?\d+/g);
+  if (!nums || nums.length < 4) return false;
+  const counts = new Map<string, number>();
+  for (const n of nums) counts.set(n, (counts.get(n) ?? 0) + 1);
+  const top = Math.max(...counts.values());
+  return top >= 3 && top / nums.length > 0.5;
+}
+
+/** Exact oracle for the common small exercise “print the first N primes”. */
+export function primeSequenceMismatch(request: string, output: string): boolean {
+  const count = Number(request.match(FIRST_PRIME_COUNT)?.[1]);
+  if (!Number.isInteger(count) || count < 1 || count > 50) return false;
+  const expected: number[] = [];
+  for (let candidate = 2; expected.length < count; candidate++) {
+    let prime = true;
+    for (let divisor = 2; divisor * divisor <= candidate; divisor++) {
+      if (candidate % divisor === 0) {
+        prime = false;
+        break;
+      }
+    }
+    if (prime) expected.push(candidate);
+  }
+  const actual = (output.match(/-?\d+/g) ?? []).map(Number).slice(-count);
+  return actual.length !== count || actual.some((value, index) => value !== expected[index]);
+}
+
+function requestsThreeNumberMinimumAndSum(request: string): boolean {
+  return (
+    THREE_NUMBER_REQUEST.test(request) &&
+    MINIMUM_REQUEST.test(request) &&
+    SUM_REQUEST.test(request)
+  );
+}
+
+function requestsThreeNumberSum(request: string): boolean {
+  return THREE_NUMBER_REQUEST.test(request) && SUM_REQUEST.test(request);
+}
+
+/**
+ * A stable probe for small interactive exercises. C scanf and repeated
+ * Python input() calls consume this directly; Python's input().split()
+ * gets a space-separated first line instead (see pythonInputPipe below).
+ */
+function numberedInputPipe(request: string): string | null {
+  const count = requestedNumberCount(request);
+  return count
+    ? `printf '${NUMBER_PROBE_VALUES.slice(0, count).join('\\n')}\\n'`
+    : null;
+}
+
+/**
+ * Run a small Python numeric-input exercise with input() replaced by a
+ * stable probe. Repeated `int(input())` calls receive values in order;
+ * input().split() receives all requested values from its first call.
+ */
+function pythonNumberProbeCommand(file: string, count: number): string {
+  const values = NUMBER_PROBE_VALUES.slice(0, count).map(String);
+  return [
+    `python3 -m py_compile ${file} && python3 - ${file} <<'MINERVA_INPUT'`,
+    'import builtins, runpy, sys',
+    '',
+    'class ProbeInput(str):',
+    '    def split(self, *args, **kwargs):',
+    `        return ${JSON.stringify(values)}`,
+    '',
+    `values = iter(${JSON.stringify(values)})`,
+    'def probe_input(prompt=""):',
+    '    print(prompt, end="", flush=True)',
+    '    return ProbeInput(next(values))',
+    '',
+    'builtins.input = probe_input',
+    "runpy.run_path(sys.argv[1], run_name='__main__')",
+    'MINERVA_INPUT',
+  ].join('\n');
+}
+
+/**
+ * True when the narrowly recognised "three numbers + minimum + sum" task
+ * did not report both deterministic results for the probe 9, 4, 2. This is
+ * the live t03 failure class: a program consumed one value and printed that
+ * value as the minimum, while exit 0 and non-empty output looked healthy.
+ */
+export function threeNumberMinimumSumMismatch(request: string, output: string): boolean {
+  if (!requestsThreeNumberMinimumAndSum(request)) return false;
+  const values = (output.match(/-?\d+(?:[.,]\d+)?/g) ?? []).map((token) =>
+    Number(token.replace(',', '.')),
+  );
+  const expectedMinimum = Math.min(...THREE_NUMBER_PROBE);
+  const expectedSum = THREE_NUMBER_PROBE.reduce((total, value) => total + value, 0);
+  return !values.includes(expectedMinimum) || !values.includes(expectedSum);
+}
+
+/**
+ * Reject a runnable three-number arithmetic exercise that printed neither
+ * the requested sum nor, when asked, the requested minimum for 9, 4, 2.
+ * Exit status alone cannot catch a program that reads only one value.
+ */
+export function threeNumberArithmeticMismatch(request: string, output: string): boolean {
+  if (!requestsThreeNumberSum(request)) return false;
+  const values = (output.match(/-?\d+(?:[.,]\d+)?/g) ?? []).map((token) =>
+    Number(token.replace(',', '.')),
+  );
+  const expectedSum = THREE_NUMBER_PROBE.reduce((total, value) => total + value, 0);
+  if (!values.includes(expectedSum)) return true;
+  return requestsThreeNumberMinimumAndSum(request) && !values.includes(Math.min(...THREE_NUMBER_PROBE));
+}
+
+/** A counted ascending-sort task must print the probe values in ascending order. */
+export function countedSortMismatch(request: string, output: string): boolean {
+  const count = requestedNumberCount(request);
+  if (!count || !/\b(?:sort\w*|ordin\w*)\b/i.test(request)) return false;
+  const actual = (output.match(/-?\d+/g) ?? []).map(Number).slice(-count);
+  const expected = [...NUMBER_PROBE_VALUES.slice(0, count)].sort((a, b) => a - b);
+  return actual.length !== count || actual.some((value, index) => value !== expected[index]);
+}
+
+/** Explicit countdown bounds are small enough to verify exactly. */
+export function countdownMismatch(request: string, output: string): boolean {
+  const match = request.match(
+    /\b(?:from|da)\s+(-?\d+)\s+(?:down\s+to|to|a|fino\s+a)\s+(-?\d+)\b/i,
+  );
+  if (!match || !/\b(?:count(?:ing)?\s+down|countdown|conto\s+alla\s+rovescia)\b/i.test(request)) {
+    return false;
+  }
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  if (start < end || start - end > 100) return false;
+  const expected = Array.from({ length: start - end + 1 }, (_, index) => start - index);
+  const actual = (output.match(/-?\d+/g) ?? []).map(Number).slice(-expected.length);
+  return actual.length !== expected.length || actual.some((value, index) => value !== expected[index]);
+}
+
 /** `- Test: `python -m pytest`` line in the project context file. */
 const CONTEXT_TEST_LINE = /^\s*[-*]?\s*test[^:`]*:\s*`([^`]+)`/im;
 
@@ -152,8 +323,8 @@ const PY_NAME_CHECK = [
   '            return',
   '        if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):',
   '            inner = S(sc); scopes.append(inner)',
-  '            for gen in node.generators:',
-  '                visit(gen.iter, sc)',
+  '            for idx, gen in enumerate(node.generators):',
+  '                visit(gen.iter, sc if idx == 0 else inner)',
   '                for n in ast.walk(gen.target):',
   '                    if isinstance(n, ast.Name): inner.bound.add(n.id)',
   '                for cond in gen.ifs: visit(cond, inner)',
@@ -168,7 +339,10 @@ const PY_NAME_CHECK = [
   "                else: sc.bound.add((alias.asname or alias.name).split('.')[0])",
   '            return',
   '        if isinstance(node, (ast.Global, ast.Nonlocal)):',
-  '            for name in node.names: sc.bound.add(name)',
+  '            for name in node.names:',
+  '                sc.bound.add(name)',
+  '                scopes[0].bound.add(name)',
+  '                if sc.parent: sc.parent.bound.add(name)',
   '            return',
   '        if isinstance(node, ast.ExceptHandler) and node.name:',
   '            sc.bound.add(node.name)',
@@ -250,15 +424,20 @@ export async function detectVerifyCommand(
     executeNamedProgram &&
     requestNamesPath(request, changedPy[0])
   ) {
+    const inputCount = requestedNumberCount(request);
     return {
-      command: `python3 ${quote(changedPy[0])}`,
+      command: inputCount
+        ? pythonNumberProbeCommand(quote(changedPy[0]), inputCount)
+        : `python3 ${quote(changedPy[0])}`,
       source: 'compile and run',
       timeoutMs: 10_000,
+      expectOutput: EXPECTS_PRINTED_OUTPUT.test(request),
     };
   }
   if (cSources.length && executeNamedProgram && cSources.some((p) => requestNamesPath(request, p))) {
+    const input = numberedInputPipe(request);
     return {
-      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacli-c.XXXXXX") && trap 'rm -f "$bin"' EXIT && cc -std=c11 -Wall -Wextra -pedantic ${cSources.map(quote).join(' ')} -o "$bin" -lm && "$bin"`,
+      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacli-c.XXXXXX") && trap 'rm -f "$bin"' EXIT && cc -std=c11 -Wall -Wextra -pedantic ${cSources.map(quote).join(' ')} -o "$bin" -lm && ${input ? `${input} | ` : ''}"$bin"`,
       source: 'compile and run',
       timeoutMs: 10_000,
     };
@@ -268,8 +447,9 @@ export async function detectVerifyCommand(
     executeNamedProgram &&
     cppSources.some((p) => requestNamesPath(request, p))
   ) {
+    const input = numberedInputPipe(request);
     return {
-      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacli-cpp.XXXXXX") && trap 'rm -f "$bin"' EXIT && c++ -std=c++17 -Wall -Wextra -pedantic ${cppSources.map(quote).join(' ')} -o "$bin" && "$bin"`,
+      command: `bin=$(mktemp "\${TMPDIR:-/tmp}/minervacli-cpp.XXXXXX") && trap 'rm -f "$bin"' EXIT && c++ -std=c++17 -Wall -Wextra -pedantic ${cppSources.map(quote).join(' ')} -o "$bin" && ${input ? `${input} | ` : ''}"$bin"`,
       source: 'compile and run',
       timeoutMs: 10_000,
     };
@@ -370,8 +550,11 @@ export async function detectVerifyCommand(
   // terminate; crashes feed their traceback back into the repair loop.
   if (changedPy.length === 1) {
     const file = quote(changedPy[0]);
+    const inputCount = requestedNumberCount(request);
     return {
-      command: `python3 -m py_compile ${file} && yes 2 | head -50 | python3 ${file}`,
+      command: inputCount
+        ? pythonNumberProbeCommand(file, inputCount)
+        : `python3 -m py_compile ${file} && yes 2 | head -50 | python3 ${file}`,
       source: 'compile and run',
       timeoutMs: 10_000,
       expectOutput: EXPECTS_PRINTED_OUTPUT.test(request),
