@@ -1,7 +1,20 @@
 {
-  "name": "minervacli",
+  "name": "@mascarock/minervacli",
   "version": "0.4.3",
   "description": "Terminal chat client and assisted coding companion for Chat Minerva",
+  "license": "MIT",
+  "author": "Mascarock",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mascarock/minervacli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mascarock/minervacli/issues"
+  },
+  "homepage": "https://github.com/mascarock/minervacli#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "files": [

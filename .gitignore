@@ -5,3 +5,5 @@ dist/
 *.env
 .minervacli/
 config.json
+scripts/stress.sh
+minervacli-0.4.3.tgz
