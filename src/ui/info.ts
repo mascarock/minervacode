@@ -11,6 +11,19 @@ function formatDate(unixSeconds: number): string {
   });
 }
 
+export function maskEmail(email: string): string {
+  const at = email.indexOf('@');
+  if (at <= 0) return '****@****.***';
+
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  const dot = domain.lastIndexOf('.');
+  const tld = dot > 0 ? domain.slice(dot) : '';
+  const visibleLocal = local.slice(0, Math.min(2, local.length));
+
+  return `${visibleLocal}****@****${tld}`;
+}
+
 export function sessionInfoLines(info: SessionInfo): string[] {
   const { user, platform, model } = info;
   const modelName = model?.name ?? info.config.model;
@@ -22,7 +35,7 @@ export function sessionInfoLines(info: SessionInfo): string[] {
 
   const lines = [
     `model: ${modelName} · Open WebUI ${platform.version}`,
-    `${user.email} · token valid until ${formatDate(user.expires_at)}`,
+    `${maskEmail(user.email)} · token valid until ${formatDate(user.expires_at)}`,
   ];
   if (capParts.length) {
     lines.push(`caps: ${capParts.join(', ')}`);
