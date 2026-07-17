@@ -10,7 +10,18 @@ export interface StreamChatOptions {
    * whole-response cap used to kill slow 7B generations mid-stream.
    */
   timeoutMs?: number;
+  /** Overrides the agent-tuned default; see the sampling note below. */
+  temperature?: number;
+  maxTokens?: number;
 }
+
+/**
+ * Coding-agent turns should be reproducible and concise. The platform
+ * default is tuned for conversational variety, which makes a small model
+ * much more likely to invent APIs or ramble past a closing fence.
+ */
+export const DEFAULT_TEMPERATURE = 0.1;
+export const DEFAULT_MAX_TOKENS = 2048;
 
 function isAbortError(err: unknown): boolean {
   return err instanceof DOMException
@@ -23,7 +34,13 @@ export async function streamChat(
   messages: ChatMessage[],
   options: StreamChatOptions = {},
 ): Promise<string> {
-  const { onChunk, signal, timeoutMs = 60_000 } = options;
+  const {
+    onChunk,
+    signal,
+    timeoutMs = 60_000,
+    temperature = DEFAULT_TEMPERATURE,
+    maxTokens = DEFAULT_MAX_TOKENS,
+  } = options;
   const idle = new AbortController();
   let idleTimer: NodeJS.Timeout | undefined;
   const armIdle = () => {
@@ -42,11 +59,8 @@ export async function streamChat(
           model: client.model,
           messages,
           stream: true,
-          // Coding-agent turns should be reproducible and concise. The platform
-          // default is tuned for conversational variety, which makes a small
-          // model much more likely to invent APIs or ramble past a closing fence.
-          temperature: 0.1,
-          max_tokens: 2048,
+          temperature,
+          max_tokens: maxTokens,
         },
         requestSignal,
       );

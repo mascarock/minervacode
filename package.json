@@ -31,7 +31,6 @@
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "test": "vitest run",
-    "prepack": "npm run build",
     "prepare": "npm run build"
   },
   "engines": {

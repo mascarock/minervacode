@@ -1,5 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { buildReviewPrompt, parseReviewFindings } from './review.js';
+import type { ModelAdapter, ModelRequest } from '../model/index.js';
+import { buildReviewPrompt, parseReviewFindings, runReviewWithModel } from './review.js';
+
+/** No MinervaClient, no HTTP: only the ModelAdapter seam. */
+function fakeModel(response: string, requests: ModelRequest[] = []): ModelAdapter {
+  return {
+    id: 'fake',
+    model: 'fake-model',
+    capabilities: { streaming: false, systemRole: true, toolCalls: false },
+    async send(request) {
+      requests.push(request);
+      return response;
+    },
+  };
+}
 
 describe('parseReviewFindings', () => {
   it('parses bracketed findings with severities', () => {
@@ -50,5 +64,54 @@ describe('buildReviewPrompt', () => {
     const prompt = buildReviewPrompt('x'.repeat(40 * 1024));
     expect(prompt).toContain('(diff truncated)');
     expect(prompt.length).toBeLessThan(30 * 1024);
+  });
+});
+
+describe('runReviewWithModel', () => {
+  it('reviews through the adapter and parses the findings', async () => {
+    const requests: ModelRequest[] = [];
+    const model = fakeModel('[BUG] calc.py — average divides by len - 1\n', requests);
+
+    const result = await runReviewWithModel(model, {
+      diff: '--- a/calc.py\n+++ b/calc.py\n+    return total / (len(xs) - 1)',
+      language: 'en',
+      intent: 'Fix the average function.',
+    });
+
+    expect(result.hasBugs).toBe(true);
+    expect(result.findings).toEqual([
+      { severity: 'bug', text: 'calc.py — average divides by len - 1' },
+    ]);
+    // Trimmed, so a trailing newline never reaches the student's transcript.
+    expect(result.raw).toBe('[BUG] calc.py — average divides by len - 1');
+  });
+
+  it('sends one fresh user message carrying the prompt, diff, and intent', async () => {
+    const requests: ModelRequest[] = [];
+    const signal = new AbortController().signal;
+
+    await runReviewWithModel(fakeModel('LGTM', requests), {
+      diff: '+x = 1',
+      language: 'en',
+      intent: 'Set x to 1.',
+      signal,
+    });
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0].messages).toHaveLength(1);
+    const [message] = requests[0].messages;
+    expect(message.role).toBe('user');
+    expect(message.content).toContain("reviewing a student's code change");
+    expect(message.content).toContain('+x = 1');
+    expect(message.content).toContain('Set x to 1.');
+    expect(requests[0].signal).toBe(signal);
+  });
+
+  it('reports a clean review with no findings', async () => {
+    const result = await runReviewWithModel(fakeModel('Traced average(  [1,2] ) → 1.5. LGTM'), {
+      diff: '+x = 1',
+    });
+    expect(result.findings).toEqual([]);
+    expect(result.hasBugs).toBe(false);
   });
 });

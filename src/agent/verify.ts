@@ -3,9 +3,33 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { bashTool } from '../tools/bash.js';
+import { requestedNumberCount, requestRequiresExecution } from './intent.js';
+import { NUMBER_PROBE_VALUES } from './oracles/probe.js';
 import { PROJECT_CONTEXT_FILE } from './prompts.js';
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Compatibility re-exports. The semantic output checks now live in
+ * ./oracles/ and request classification in ./intent.js, but the verifier
+ * remains their published entry point.
+ */
+export {
+  canonicalCallMismatch,
+  countdownMismatch,
+  countedSortMismatch,
+  degenerateSequenceOutput,
+  evaluateOutput,
+  fibonacciSequenceMismatch,
+  fizzBuzzMismatch,
+  primeSequenceMismatch,
+  statedExpectedOutputMismatch,
+  threeNumberArithmeticMismatch,
+  threeNumberMinimumSumMismatch,
+  type Oracle,
+  type OracleVerdict,
+} from './oracles/index.js';
+export { requestRequiresExecution };
 
 export interface VerifyCommand {
   command: string;
@@ -20,83 +44,6 @@ export interface VerifyCommand {
 /** The request asks for a program whose point is PRINTING something. */
 const EXPECTS_PRINTED_OUTPUT =
   /\b(?:print\w*|stamp\w*|output|display\w*|mostra\w*|visualizz\w*|greet\w*|salut\w*|count\w*|conta\w*)\b/i;
-
-/**
- * Requests whose output is an inherently DISTINCT integer sequence — the
- * first N primes or Fibonacci numbers. Deterministic verification cannot
- * judge correctness in general, but for these a collapse to one repeated
- * value is an unambiguous broken-generator signal (observed live: "first
- * 20 primes" emitting twenty 2s, yet passing the compile-and-run gate).
- */
-const DISTINCT_SEQUENCE_NOUN = /\b(?:primes?|prime numbers?|numeri primi|fibonacci)\b/i;
-const FIRST_PRIME_COUNT = /\b(?:first|primi)\s+(\d+)\s+(?:primes?|prime numbers?|numeri primi)\b/i;
-
-const THREE_NUMBER_REQUEST = /\b(?:three|3|tre)\s+(?:numbers?|integers?|numeri)\b/i;
-const MINIMUM_REQUEST = /\b(?:min(?:imum)?|smallest|pi[uù]\s+piccol\w*|minim\w*)\b/i;
-const SUM_REQUEST = /\b(?:sum|add|total|somm\w*)\b/i;
-const THREE_NUMBER_PROBE = [9, 4, 2] as const;
-const NUMBER_WORDS: Record<string, number> = {
-  one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
-  uno: 1, due: 2, tre: 3, quattro: 4, cinque: 5, sei: 6, sette: 7, otto: 8, nove: 9, dieci: 10,
-};
-const COUNTED_NUMBER_REQUEST = /\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten|uno|due|tre|quattro|cinque|sei|sette|otto|nove|dieci)\s+(?:numbers?|integers?|numeri)\b/i;
-const NUMBER_PROBE_VALUES = [9, 4, 2, 7, 1, 6, 3, 8, 5, 0] as const;
-
-/** Number of requested interactive integers, bounded to a small safe probe. */
-function requestedNumberCount(request: string): number | null {
-  const raw = request.match(COUNTED_NUMBER_REQUEST)?.[1]?.toLowerCase();
-  if (!raw) return null;
-  const count = /^\d+$/.test(raw) ? Number(raw) : NUMBER_WORDS[raw];
-  return Number.isInteger(count) && count >= 2 && count <= NUMBER_PROBE_VALUES.length
-    ? count
-    : null;
-}
-
-/**
- * True when a distinct-sequence request produced output dominated by a
- * single repeated number — sound (a correct sequence has distinct terms),
- * and narrowly gated so it never fires on ordinary programs.
- */
-export function degenerateSequenceOutput(request: string, output: string): boolean {
-  if (!DISTINCT_SEQUENCE_NOUN.test(request) || !/\d/.test(request)) return false;
-  const nums = output.match(/-?\d+/g);
-  if (!nums || nums.length < 4) return false;
-  const counts = new Map<string, number>();
-  for (const n of nums) counts.set(n, (counts.get(n) ?? 0) + 1);
-  const top = Math.max(...counts.values());
-  return top >= 3 && top / nums.length > 0.5;
-}
-
-/** Exact oracle for the common small exercise “print the first N primes”. */
-export function primeSequenceMismatch(request: string, output: string): boolean {
-  const count = Number(request.match(FIRST_PRIME_COUNT)?.[1]);
-  if (!Number.isInteger(count) || count < 1 || count > 50) return false;
-  const expected: number[] = [];
-  for (let candidate = 2; expected.length < count; candidate++) {
-    let prime = true;
-    for (let divisor = 2; divisor * divisor <= candidate; divisor++) {
-      if (candidate % divisor === 0) {
-        prime = false;
-        break;
-      }
-    }
-    if (prime) expected.push(candidate);
-  }
-  const actual = (output.match(/-?\d+/g) ?? []).map(Number).slice(-count);
-  return actual.length !== count || actual.some((value, index) => value !== expected[index]);
-}
-
-function requestsThreeNumberMinimumAndSum(request: string): boolean {
-  return (
-    THREE_NUMBER_REQUEST.test(request) &&
-    MINIMUM_REQUEST.test(request) &&
-    SUM_REQUEST.test(request)
-  );
-}
-
-function requestsThreeNumberSum(request: string): boolean {
-  return THREE_NUMBER_REQUEST.test(request) && SUM_REQUEST.test(request);
-}
 
 /**
  * A stable probe for small interactive exercises. C scanf and repeated
@@ -136,108 +83,10 @@ function pythonNumberProbeCommand(file: string, count: number): string {
   ].join('\n');
 }
 
-/**
- * True when the narrowly recognised "three numbers + minimum + sum" task
- * did not report both deterministic results for the probe 9, 4, 2. This is
- * the live t03 failure class: a program consumed one value and printed that
- * value as the minimum, while exit 0 and non-empty output looked healthy.
- */
-export function threeNumberMinimumSumMismatch(request: string, output: string): boolean {
-  if (!requestsThreeNumberMinimumAndSum(request)) return false;
-  const values = (output.match(/-?\d+(?:[.,]\d+)?/g) ?? []).map((token) =>
-    Number(token.replace(',', '.')),
-  );
-  const expectedMinimum = Math.min(...THREE_NUMBER_PROBE);
-  const expectedSum = THREE_NUMBER_PROBE.reduce((total, value) => total + value, 0);
-  return !values.includes(expectedMinimum) || !values.includes(expectedSum);
-}
-
-/**
- * Reject a runnable three-number arithmetic exercise that printed neither
- * the requested sum nor, when asked, the requested minimum for 9, 4, 2.
- * Exit status alone cannot catch a program that reads only one value.
- */
-export function threeNumberArithmeticMismatch(request: string, output: string): boolean {
-  if (!requestsThreeNumberSum(request)) return false;
-  const values = (output.match(/-?\d+(?:[.,]\d+)?/g) ?? []).map((token) =>
-    Number(token.replace(',', '.')),
-  );
-  const expectedSum = THREE_NUMBER_PROBE.reduce((total, value) => total + value, 0);
-  if (!values.includes(expectedSum)) return true;
-  return requestsThreeNumberMinimumAndSum(request) && !values.includes(Math.min(...THREE_NUMBER_PROBE));
-}
-
-/** A counted ascending-sort task must print the probe values in ascending order. */
-export function countedSortMismatch(request: string, output: string): boolean {
-  const count = requestedNumberCount(request);
-  if (!count || !/\b(?:sort\w*|ordin\w*)\b/i.test(request)) return false;
-  const actual = (output.match(/-?\d+/g) ?? []).map(Number).slice(-count);
-  const expected = [...NUMBER_PROBE_VALUES.slice(0, count)].sort((a, b) => a - b);
-  return actual.length !== count || actual.some((value, index) => value !== expected[index]);
-}
-
-const NUMERIC_RANGE =
-  /\b(?:from|da)\s+(-?\d+)\s+(?:down\s+to|to|a|fino\s+a)\s+(-?\d+)\b/i;
-
-function fizzBuzzLine(n: number): string {
-  if (n % 15 === 0) return 'FizzBuzz';
-  if (n % 3 === 0) return 'Fizz';
-  if (n % 5 === 0) return 'Buzz';
-  return String(n);
-}
-
-/** FizzBuzz over an explicit numeric range must print every line in order. */
-export function fizzBuzzMismatch(request: string, output: string): boolean {
-  if (!/\bfizz\s*buzz\b/i.test(request)) return false;
-  const match = request.match(NUMERIC_RANGE);
-  if (!match) return false;
-  const start = Number(match[1]);
-  const end = Number(match[2]);
-  if (start > end || end - start > 100) return false;
-  const expected = Array.from({ length: end - start + 1 }, (_, index) =>
-    fizzBuzzLine(start + index),
-  );
-  const actual = output
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-  const tail = actual.slice(-expected.length);
-  return tail.length !== expected.length || tail.some((value, index) => value !== expected[index]);
-}
-
-/** Explicit countdown bounds are small enough to verify exactly. */
-export function countdownMismatch(request: string, output: string): boolean {
-  const match = request.match(NUMERIC_RANGE);
-  if (
-    !match ||
-    !/\b(?:counts?\s+down|count(?:ing)?\s+down|countdown|conto\s+alla\s+rovescia)\b/i.test(
-      request,
-    )
-  ) {
-    return false;
-  }
-  const start = Number(match[1]);
-  const end = Number(match[2]);
-  if (start < end || start - end > 100) return false;
-  const expected = Array.from({ length: start - end + 1 }, (_, index) => start - index);
-  const actual = (output.match(/-?\d+/g) ?? []).map(Number).slice(-expected.length);
-  return actual.length !== expected.length || actual.some((value, index) => value !== expected[index]);
-}
-
 /** `- Test: `python -m pytest`` line in the project context file. */
 const CONTEXT_TEST_LINE = /^\s*[-*]?\s*test[^:`]*:\s*`([^`]+)`/im;
 
 const PY_TEST_FILE = /(^|\/)(test_[^/]+\.py|[^/]+_test\.py)$/;
-const REQUIRES_EXECUTION =
-  /\b(?:run|runs|running|execute|executes|executed|executing|launch|esegu\w*|avvi\w*)\b/i;
-const TEST_EXECUTION_PHRASE =
-  /\b(?:run|runs|running|execute|executes|executed|executing|esegu\w*|avvi\w*)\s+(?:the\s+|i\s+|gli\s+|la\s+|le\s+)?tests?\b/gi;
-
-export function requestRequiresExecution(request: string): boolean {
-  // "Run the tests" asks for verification, not for executing a changed
-  // source module as a standalone program.
-  return REQUIRES_EXECUTION.test(request.replace(TEST_EXECUTION_PHRASE, ''));
-}
 
 async function pythonHasPytest(): Promise<boolean> {
   try {
@@ -246,6 +95,40 @@ async function pythonHasPytest(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** `javac -version` proves a full JDK. Probed once per process — a toolchain
+ * cannot appear mid-run, and a JVM launch costs hundreds of milliseconds. */
+let jdkProbe: Promise<boolean> | null = null;
+function jdkAvailable(): Promise<boolean> {
+  jdkProbe ??= execFileAsync('javac', ['-version']).then(
+    () => true,
+    () => false,
+  );
+  return jdkProbe;
+}
+
+/**
+ * Fully-qualified name of the class declaring `static void main`, searching
+ * `files` in order. Approximation for flat student code: the owning class is
+ * the last one declared before the main signature.
+ */
+async function javaMainClass(projectDir: string, files: string[]): Promise<string | null> {
+  for (const rel of files) {
+    const content = await readProjectFile(projectDir, rel);
+    if (!content) continue;
+    const mainIndex = content.search(/\bstatic\s+void\s+main\s*\(/);
+    if (mainIndex < 0) continue;
+    let cls: string | null = null;
+    for (const match of content.matchAll(/\bclass\s+([A-Za-z_$][\w$]*)/g)) {
+      if ((match.index ?? 0) > mainIndex) break;
+      cls = match[1];
+    }
+    if (!cls) continue;
+    const pkg = content.match(/^\s*package\s+([\w.]+)\s*;/m)?.[1];
+    return pkg ? `${pkg}.${cls}` : cls;
+  }
+  return null;
 }
 
 async function readProjectFile(projectDir: string, rel: string): Promise<string | null> {
@@ -435,6 +318,7 @@ export async function detectVerifyCommand(
   changedPaths: string[],
   hasPytest: () => Promise<boolean> = pythonHasPytest,
   request = '',
+  hasJdk: () => Promise<boolean> = jdkAvailable,
 ): Promise<VerifyCommand | null> {
   const uniqueChangedPaths = [...new Set(changedPaths)];
   const context = await readProjectFile(projectDir, PROJECT_CONTEXT_FILE);
@@ -485,6 +369,31 @@ export async function detectVerifyCommand(
       source: 'compile and run',
       timeoutMs: 10_000,
     };
+  }
+  // Changed Java with a run request: compile the whole (student-sized)
+  // Java file set together and run the class that declares main, so "no
+  // verifier for .java" can never silently stand in for "it ran and printed
+  // the right thing". Compiling everything catches cross-file symbol breaks;
+  // resolving main by content survives helper-class-first files and helper
+  // edits in a Main.java+Helper.java project (the JEP 330 source launcher
+  // handles neither).
+  const javaSources = uniqueChangedPaths.filter((p) => p.endsWith('.java'));
+  const projectJava = [
+    ...new Set([...javaSources, ...projectFiles.filter((p) => p.endsWith('.java'))]),
+  ];
+  if (javaSources.length && executeNamedProgram && (await hasJdk())) {
+    const named = projectJava.filter((p) => requestNamesPath(request, p));
+    const searchOrder = [...new Set([...named, ...javaSources, ...projectJava])];
+    const mainClass = await javaMainClass(projectDir, searchOrder);
+    if (mainClass) {
+      const input = numberedInputPipe(request);
+      return {
+        command: `dir=$(mktemp -d "\${TMPDIR:-/tmp}/minervacode-java.XXXXXX") && trap 'rm -rf "$dir"' EXIT && javac -d "$dir" ${projectJava.map(quote).join(' ')} && ${input ? `${input} | ` : ''}java -cp "$dir" ${mainClass}`,
+        source: 'compile and run',
+        timeoutMs: 15_000,
+        expectOutput: EXPECTS_PRINTED_OUTPUT.test(request),
+      };
+    }
   }
 
   const packageManager = detectPackageManager(projectFiles);
@@ -631,6 +540,15 @@ export async function detectVerifyCommand(
     return {
       command: `c++ -fsyntax-only ${cppFiles.map(quote).join(' ')}`,
       source: 'syntax check',
+    };
+  }
+  // Changed Java without a run request (or no detectable main): compiling
+  // the whole file set to a throwaway directory still catches the dominant
+  // failure class, including cross-file symbol breaks.
+  if (javaSources.length && (await hasJdk())) {
+    return {
+      command: `dir=$(mktemp -d "\${TMPDIR:-/tmp}/minervacode-java.XXXXXX") && trap 'rm -rf "$dir"' EXIT && javac -d "$dir" ${projectJava.map(quote).join(' ')}`,
+      source: 'compile check',
     };
   }
 

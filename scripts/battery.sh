@@ -5,7 +5,7 @@
 #   bash scripts/battery.sh            # run all cases
 #   bash scripts/battery.sh t03 t15    # run a subset
 #
-# Requirements: `npm run build` first, and saved credentials (`minervacli
+# Requirements: `npm run build` first, and saved credentials (`minervacode
 # login`). Each case runs `dist/index.js --auto` in a fresh scratch dir;
 # auto mode reverts unverified runs and exits nonzero, so the exit column
 # is the CLI's own honesty signal. exit=0 means "verified", exit=1 an
@@ -17,8 +17,8 @@
 set -u
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-CLI="${MINERVACLI_BIN:-$REPO/dist/index.js}"
-BASE="$(mktemp -d "${TMPDIR:-/tmp}/minervacli-battery.XXXXXX")"
+CLI="${MINERVACODE_BIN:-${MINERVACLI_BIN:-$REPO/dist/index.js}}"
+BASE="$(mktemp -d "${TMPDIR:-/tmp}/minervacode-battery.XXXXXX")"
 RESULTS="$BASE/results.txt"
 : > "$RESULTS"
 
@@ -115,8 +115,15 @@ echo "── artifact smoke grades (run_exit != 0 or empty output on a print tas
 find "$BASE" -maxdepth 2 -name '*.py' | sort | while read -r f; do
   rel="${f#"$BASE"/}"
   dir="$(dirname "$f")"
-  out=$(cd "$dir" && yes 2 | head -20 | python3 "$(basename "$f")" 2>&1 | head -2 | tr '\n' '|')
-  (cd "$dir" && yes 2 | head -20 | python3 "$(basename "$f")" >/dev/null 2>&1)
+  # t03 explicitly allows a single space-separated input line. Feeding one
+  # number per line makes a correct input().split() solution look broken.
+  if [ "$rel" = "t03/main.py" ]; then
+    out=$(cd "$dir" && printf '9 4 2\n' | python3 "$(basename "$f")" 2>&1 | head -2 | tr '\n' '|')
+    (cd "$dir" && printf '9 4 2\n' | python3 "$(basename "$f")" >/dev/null 2>&1)
+  else
+    out=$(cd "$dir" && yes 2 | head -20 | python3 "$(basename "$f")" 2>&1 | head -2 | tr '\n' '|')
+    (cd "$dir" && yes 2 | head -20 | python3 "$(basename "$f")" >/dev/null 2>&1)
+  fi
   rc=$?
   printf '  %-28s run_exit=%s  %s\n' "$rel" "$rc" "$out"
 done

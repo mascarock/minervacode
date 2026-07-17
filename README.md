@@ -68,6 +68,10 @@ minervacode info
 minervacode "Ciao Minerva, come stai?"
 ```
 
+Conversational messages sent from a directory with no source/content files
+skip the agent scaffolding entirely and get a plain chat reply — the full
+rule set and repository map measurably derail the 7B on small talk.
+
 ### Interactive REPL
 
 ```bash
@@ -131,8 +135,13 @@ did not verify. Assisted mode is the recommended default.
    `.minervacode.md` → the `package.json` `test`, `typecheck`, or `build`
    script (npm/yarn/pnpm/bun detected from the lockfile) → `pytest` /
    `unittest` if test files exist → `tsc --noEmit` if `tsconfig.json`
-   exists → compile **and run** a requested C/C++ program when the request
-   asks for execution → a syntax check of the changed files. At the end of a
+   exists → compile **and run** a requested C/C++ or Java program when the
+   request asks for execution (Java needs a JDK; the harness compiles every
+   `.java` together and runs the class with `main`) → a syntax/compile check
+   of the changed files. If the request asked to run the program and none of
+   this actually executes the requested source (an unrelated passing test or
+   build does not count), the run is reported as **unverified** and fails —
+   never silent success. At the end of a
    verified run the CLI prints the command and its real output, so you can
    confirm the program actually printed what you asked for — "it compiled
    and exited 0" is not the same as "it is correct".

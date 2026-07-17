@@ -9,14 +9,18 @@ import {
   MAX_VERIFY_RUNS,
   definesIdentifier,
   isBareAffirmation,
+  isConversationalRequest,
   requestExplicitSourcePaths,
   requestAllowsNewFile,
   requestExpectsChanges,
   requestAllowsTestEdit,
   requestRequiredDefinitions,
+  requestRequiredDefinitionsWithConfidence,
   runAgent,
+  runAgentWithModel,
   type AgentEvents,
 } from './loop.js';
+import type { ModelAdapter, ModelRequest } from '../model/index.js';
 
 const dirs: string[] = [];
 
@@ -47,6 +51,26 @@ function mockClient(responses: string[], requestBodies: unknown[] = []): Minerva
     requestBodies.push(body);
     return sseResponse(responses.shift() ?? 'Done.');
   });
+}
+
+/**
+ * An adapter with no Minerva anywhere behind it: no MinervaClient, no HTTP,
+ * no SSE. Anything that reaches for the provider fails here rather than
+ * silently working.
+ */
+function fakeModel(responses: string[], requests: ModelRequest[] = []): ModelAdapter {
+  return {
+    id: 'fake',
+    model: 'fake-model',
+    capabilities: { streaming: false, systemRole: true, toolCalls: false },
+    async send(request) {
+      // The loop appends to its live message array between turns; the real
+      // transport serializes the body on the spot. Snapshot so each recorded
+      // request is what was actually sent, not the final state.
+      requests.push({ ...request, messages: [...request.messages] });
+      return responses.shift() ?? 'Done.';
+    },
+  };
 }
 
 function autoEvents(): AgentEvents {
@@ -792,7 +816,7 @@ describe('autonomous agent loop', () => {
     expect(body.messages[2].content).toContain('return false');
   });
 
-  it('feeds a failing initial test run into the first model request', async () => {
+  it('feeds a failing initial test run into the first model request', { timeout: 20_000 }, async () => {
     const projectDir = await tempProject();
     await mkdir(path.join(projectDir, 'src'));
     await mkdir(path.join(projectDir, 'test'));
@@ -1744,5 +1768,505 @@ describe('autonomous agent loop', () => {
 
     expect(requestBodies).toHaveLength(2);
     expect(existsSync(path.join(projectDir, 'main.py'))).toBe(true);
+  });
+});
+
+describe('requestRequiredDefinitions (prose parentheticals)', () => {
+  it('ignores nouns followed by a parenthetical remark', () => {
+    // Both observed live: an otherwise-correct run failed "requirements-unmet".
+    expect(
+      requestRequiredDefinitions(
+        'Write Fibonacci.java, a Java program that prints the first 10 Fibonacci numbers (starting 0 1) separated by spaces on one line. Compile and run it to show the output.',
+      ),
+    ).toEqual([]);
+    expect(
+      requestRequiredDefinitions(
+        'Contatore.java dovrebbe stampare 5 (le vocali di "universita") ma stampa 4. Trova il bug e correggilo.',
+      ),
+    ).toEqual([]);
+  });
+
+  it('still extracts calls with literal or list arguments', () => {
+    expect(
+      requestRequiredDefinitions(
+        'Create stats.py with a function median(numbers) and print median([3, 1, 4, 1, 5]).',
+      ),
+    ).toEqual(['median']);
+    expect(requestRequiredDefinitions('Print gcd(12, 18) and factorial(5).')).toEqual([
+      'gcd',
+      'factorial',
+    ]);
+  });
+
+  it('ignores bilingual glosses but honours definition cues with spaces', () => {
+    expect(
+      requestRequiredDefinitions('Calcola la media(average) di tre numeri e stampala.'),
+    ).toEqual([]);
+    expect(
+      requestRequiredDefinitions('Stampa i numeri in ordine crescente(ascending) fino a 20.'),
+    ).toEqual([]);
+    expect(
+      requestRequiredDefinitions(
+        'Scrivi una funzione somma (a, b) che restituisce la somma dei due numeri.',
+      ),
+    ).toEqual(['somma']);
+    expect(requestRequiredDefinitions('Add a function is_prime (n) to utils.py.')).toEqual([
+      'is_prime',
+    ]);
+  });
+});
+
+describe('isConversationalRequest', () => {
+  const fileless = ['archive.tgz', 'foto.png'];
+
+  it('routes chat-like messages in a contentless directory to plain chat', () => {
+    expect(isConversationalRequest('Quanto fa 2+2?', fileless)).toBe(true);
+    expect(isConversationalRequest('Rispondi solo con il risultato di 2+2', fileless)).toBe(true);
+    expect(isConversationalRequest('Spiega la ricorsione', fileless)).toBe(true);
+    expect(isConversationalRequest('Ciao, come stai?', fileless)).toBe(true);
+  });
+
+  it('keeps anything project- or code-referential on the agent path', () => {
+    expect(
+      isConversationalRequest("C'è un bug in utils.py: trovalo e correggilo.", fileless),
+    ).toBe(false);
+    expect(isConversationalRequest('Explain this project', fileless)).toBe(false);
+    expect(isConversationalRequest('Run the program', fileless)).toBe(false);
+    expect(isConversationalRequest('Write primes.cpp and run it', fileless)).toBe(false);
+    expect(isConversationalRequest('Spiega il codice', fileless)).toBe(false);
+    // Question-phrased creation requests defeat the change-verb gate but
+    // must still reach the agent (observed adversarial probe).
+    expect(
+      isConversationalRequest('Perché non crei tu un piccolo gioco in Python e lo salvi qui?', fileless),
+    ).toBe(false);
+    expect(
+      isConversationalRequest('What about creating a small quiz in Python and saving it here?', fileless),
+    ).toBe(false);
+    expect(
+      requestExpectsChanges('Perché non crei tu un piccolo gioco in Python e lo salvi qui?'),
+    ).toBe(true);
+    expect(
+      requestExpectsChanges('What about creating a small quiz in Python and saving it here?'),
+    ).toBe(true);
+  });
+
+  it('never routes to chat when the directory has content files', () => {
+    expect(isConversationalRequest('Quanto fa 2+2?', ['calc.py'])).toBe(false);
+    expect(isConversationalRequest('Count x up.', ['calc.py'])).toBe(false);
+    expect(isConversationalRequest('Inspect validateToken in auth.', ['auth.ts'])).toBe(false);
+    // Web and notes directories count as content too.
+    expect(
+      isConversationalRequest('Perché la mia pagina è tutta blu?', ['index.html', 'style.css']),
+    ).toBe(false);
+    expect(isConversationalRequest('Summarize my notes', ['notes.txt'])).toBe(false);
+  });
+});
+
+describe('conversational light chat routing', () => {
+  it('answers without the agent scaffold or repository map', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'archive.tgz'), 'not-content\n');
+    const requestBodies: unknown[] = [];
+    const texts: string[] = [];
+    const events = autoEvents();
+    events.onText = (t) => texts.push(t);
+
+    const result = await runAgent(mockClient(['4'], requestBodies), {
+      history: [],
+      prompt: 'Quanto fa 2+2?',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'auto',
+      events,
+    });
+
+    expect(result.status).toBe('completed');
+    expect(result.finalText).toBe('4');
+    expect(result.changes).toEqual([]);
+    expect(texts).toEqual(['4']);
+    const first = JSON.stringify(requestBodies[0]);
+    expect(first).not.toContain('Repository map');
+    expect(first).not.toContain('minerva_tool');
+    expect(first).not.toContain('programming agent');
+    // History persists the student's words, not the injected persona.
+    expect(result.history.at(-2)).toEqual({ role: 'user', content: 'Quanto fa 2+2?' });
+  });
+
+  it('still injects the agent scaffold on the first agent turn after light chat', async () => {
+    const projectDir = await tempProject();
+    const chat = await runAgent(mockClient(['4']), {
+      history: [],
+      prompt: 'Quanto fa 2+2?',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'auto',
+      events: autoEvents(),
+    });
+    expect(chat.status).toBe('completed');
+
+    await writeFile(path.join(projectDir, 'calc.py'), 'x = 1\n');
+    const requestBodies: unknown[] = [];
+    await runAgent(mockClient(['Done.'], requestBodies), {
+      history: chat.history,
+      prompt: 'Set x to 2 in calc.py.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+    // The chat turn left history non-empty; instruction injection must key
+    // on content, or the model never learns the tool protocol.
+    expect(JSON.stringify(requestBodies[0])).toContain('You are Minerva, a programming agent');
+  });
+
+  it('acts on a question-phrased creation request instead of treating it as chat', async () => {
+    const projectDir = await tempProject();
+    const requestBodies: unknown[] = [];
+    const write = 'Updated `quiz.py`:\n\n```python\nprint("quiz")\n```';
+
+    const result = await runAgent(
+      mockClient(['Would you like me to create it?', write, 'Done.'], requestBodies),
+      {
+        history: [],
+        prompt: 'What about creating a small quiz in Python and saving it here?',
+        projectDir,
+        permissionMode: 'dontAsk',
+        language: 'en',
+        events: autoEvents(),
+        review: false,
+      },
+    );
+
+    expect(result.status).toBe('completed');
+    expect(existsSync(path.join(projectDir, 'quiz.py'))).toBe(true);
+    expect(requestBodies.length).toBeGreaterThan(1);
+  });
+});
+
+describe('repeated refusal bail-out', () => {
+  it('stops after the same guardrail refuses three times', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'calc.py'), 'def add(a, b):\n    return a - b\n');
+    const badWrite =
+      '<minerva_tool name="Write">\n<path>helper.py</path>\n<content>\nprint(1)\n</content>\n</minerva_tool>';
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (t) => statuses.push(t);
+    const requestBodies: unknown[] = [];
+
+    const result = await runAgent(
+      mockClient([badWrite, badWrite, badWrite, badWrite, badWrite], requestBodies),
+      {
+        history: [],
+        prompt: 'Fix the bug in calc.py.',
+        projectDir,
+        permissionMode: 'dontAsk',
+        language: 'en',
+        events,
+      },
+    );
+
+    expect(result.status).toBe('requirements-unmet');
+    expect(statuses.some((s) => s.includes('refused 3 times'))).toBe(true);
+    // 3 refusals, not the full turn budget.
+    expect(requestBodies.length).toBe(3);
+    expect(existsSync(path.join(projectDir, 'helper.py'))).toBe(false);
+  });
+});
+
+describe('unverifiable execution request', () => {
+  it('never reports success when a run request had no applicable verifier', async () => {
+    const projectDir = await tempProject();
+    await writeFile(
+      path.join(projectDir, 'main.go'),
+      'package main\n\nfunc main() { println(41) }\n',
+    );
+    const fixWrite =
+      '<minerva_tool name="Write">\n<path>main.go</path>\n<content>\npackage main\n\nfunc main() { println(42) }\n</content>\n</minerva_tool>';
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (t) => statuses.push(t);
+
+    const result = await runAgent(mockClient([fixWrite, 'Done.']), {
+      history: [],
+      prompt: 'Fix main.go and run it to show the output.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events,
+    });
+
+    expect(result.verified).toBe(false);
+    expect(statuses.some((s) => s.includes('UNVERIFIED'))).toBe(true);
+  });
+
+  it('does not let an unrelated passing package test stand in for running the program', async () => {
+    const projectDir = await tempProject();
+    await writeFile(
+      path.join(projectDir, 'main.go'),
+      'package main\n\nfunc main() { println(41) }\n',
+    );
+    await writeFile(
+      path.join(projectDir, 'package.json'),
+      JSON.stringify({ scripts: { test: 'node -e "process.exit(0)"' } }),
+    );
+    const fixWrite =
+      '<minerva_tool name="Write">\n<path>main.go</path>\n<content>\npackage main\n\nfunc main() { println(42) }\n</content>\n</minerva_tool>';
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+
+    const result = await runAgent(mockClient([fixWrite, 'Done.']), {
+      history: [],
+      prompt: 'Fix main.go and run it to show the output.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events,
+      review: false,
+    });
+
+    expect(result.verification).toMatchObject({ source: 'package.json test script', ok: true });
+    expect(result.verified).toBe(false);
+    expect(statuses.some((s) => s.includes('no command actually executed main.go'))).toBe(true);
+  });
+});
+
+describe('required-definition confidence policy', () => {
+  it('does not reject a verified result over a definition only inferred from prose', async () => {
+    const projectDir = await tempProject();
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+    // "area(5)" is bare call syntax with no definition cue: prose writes
+    // examples this way, so it must not be able to fail an otherwise
+    // verified run.
+    const responses = [
+      'Updated `main.py`:\n\n```python\nprint(78.5)\n```',
+      'Done.',
+      'Done.',
+      'Done.',
+    ];
+
+    const result = await runAgent(mockClient(responses), {
+      history: [],
+      prompt: 'Write main.py that prints the result of area(5).',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      review: false,
+      events,
+    });
+
+    expect(requestRequiredDefinitionsWithConfidence(
+      'Write main.py that prints the result of area(5).',
+    )).toEqual([{ name: 'area', confidence: 'likely' }]);
+    expect(result.status).toBe('completed');
+    expect(result.verified).toBe(true);
+    // The student is still told, without the run being thrown away.
+    expect(statuses.some((s) => s.includes('area'))).toBe(true);
+  });
+
+  it('still fails when an explicitly requested function is never defined', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'utils.py'), 'def double(n):\n    return n * 2\n');
+    const responses = [
+      'Updated `utils.py`:\n\n```python\ndef double(n):\n    return n * 2\n```',
+      'Done.',
+      'Done.',
+      'Done.',
+    ];
+
+    const result = await runAgent(mockClient(responses), {
+      history: [],
+      prompt: 'Add a function is_even(n) to utils.py that returns True for even numbers.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      review: false,
+      events: autoEvents(),
+    });
+
+    expect(result.status).toBe('requirements-unmet');
+  });
+});
+
+describe('guard-keyed refusal bail-out', () => {
+  it('stops when one guardrail refuses three times across different paths', async () => {
+    const projectDir = await tempProject();
+    await writeFile(path.join(projectDir, 'calc.py'), 'def add(a, b):\n    return a - b\n');
+    const write = (file: string) =>
+      `<minerva_tool name="Write">\n<path>${file}</path>\n<content>\nprint(1)\n</content>\n</minerva_tool>`;
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+    const requestBodies: unknown[] = [];
+
+    // Same guard every time, a different filename every time. Counting the
+    // refusal TEXT would never reach three, letting the model spin to the
+    // turn limit by cycling names.
+    const result = await runAgent(
+      mockClient(
+        [write('a.py'), write('b.py'), write('c.py'), write('d.py'), write('e.py')],
+        requestBodies,
+      ),
+      {
+        history: [],
+        prompt: 'Fix the bug in calc.py.',
+        projectDir,
+        permissionMode: 'dontAsk',
+        language: 'en',
+        events,
+      },
+    );
+
+    expect(result.status).toBe('requirements-unmet');
+    expect(statuses.some((s) => s.includes('refused 3 times'))).toBe(true);
+    expect(requestBodies.length).toBe(3);
+    for (const file of ['a.py', 'b.py', 'c.py']) {
+      expect(existsSync(path.join(projectDir, file))).toBe(false);
+    }
+  });
+});
+
+describe('provider independence', () => {
+  it('runs the whole agent core on a non-Minerva adapter', async () => {
+    const projectDir = await tempProject();
+    const requests: ModelRequest[] = [];
+    const model = fakeModel(
+      [
+        'Creating it now.\n<minerva_tool name="Write">\n<path>answer.js</path>\n<content>\nconsole.log(42);\n</content>\n</minerva_tool>',
+        'Implemented and verified successfully.',
+        'LGTM', // advisory review
+      ],
+      requests,
+    );
+    const texts: string[] = [];
+
+    const result = await runAgentWithModel(model, {
+      history: [],
+      prompt: 'Create the answer program.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: { ...autoEvents(), onText: (text) => texts.push(text) },
+    });
+
+    expect(await readFile(path.join(projectDir, 'answer.js'), 'utf-8')).toBe('console.log(42);\n');
+    expect(result.changes.map((c) => c.path)).toEqual(['answer.js']);
+    expect(result.status).toBe('completed');
+    expect(result.verified).toBe(true);
+    // Tool blocks are stripped from the visible text, as on the client path.
+    expect(texts[0]).toBe('Creating it now.');
+    expect(texts.join('\n')).not.toContain('minerva_tool');
+  });
+
+  it('sends the agent instructions, the request, and verification results to the adapter', async () => {
+    const projectDir = await tempProject();
+    const requests: ModelRequest[] = [];
+    const model = fakeModel(
+      [
+        'Updated `answer.js`:\n\n```js\nconsole.log(42);\n```',
+        'Done.',
+        'LGTM',
+      ],
+      requests,
+    );
+
+    await runAgentWithModel(model, {
+      history: [],
+      prompt: 'Create the answer program.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    expect(requests).toHaveLength(3);
+    // request 1: agent instructions plus the student's request.
+    expect(requests[0].messages[0].content).toContain('You are Minerva, a programming agent');
+    expect(requests[0].messages.at(-1)?.content).toContain('Create the answer program.');
+    // request 2: the harness verification result the model must act on.
+    const second = requests[1].messages.at(-1)?.content ?? '';
+    expect(second).toContain('node --check');
+    expect(second).toContain('Verification passed');
+  });
+
+  it('keeps the advisory review on the same adapter', async () => {
+    const projectDir = await tempProject();
+    const requests: ModelRequest[] = [];
+    const model = fakeModel(
+      [
+        'Updated `answer.js`:\n\n```js\nconsole.log(42);\n```',
+        'Done.',
+        '[BUG] answer.js — prints 41 instead of 42',
+      ],
+      requests,
+    );
+    const texts: string[] = [];
+    const statuses: string[] = [];
+
+    await runAgentWithModel(model, {
+      history: [],
+      prompt: 'Create the answer program.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: {
+        ...autoEvents(),
+        onText: (text) => texts.push(text),
+        onStatus: (text) => statuses.push(text),
+      },
+    });
+
+    // The review is a fresh one-shot conversation on the SAME adapter — a
+    // non-Minerva run must not fall back to a Minerva client to review itself.
+    const review = requests[2];
+    expect(review.messages).toHaveLength(1);
+    expect(review.messages[0].content).toContain("reviewing a student's code change");
+    expect(texts.at(-1)).toContain('[BUG] answer.js');
+    expect(statuses.at(-1)).toContain('advisory review');
+    // Advisory only: the verified file is left exactly as applied.
+    expect(await readFile(path.join(projectDir, 'answer.js'), 'utf-8')).toBe('console.log(42);\n');
+  });
+
+  it('runs a light chat turn through the adapter', async () => {
+    const projectDir = await tempProject();
+    const requests: ModelRequest[] = [];
+    const result = await runAgentWithModel(fakeModel(['4'], requests), {
+      history: [],
+      prompt: 'quanto fa 2+2?',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'auto',
+      events: autoEvents(),
+    });
+
+    expect(result.finalText).toBe('4');
+    expect(requests[0].messages.at(-1)?.content).toContain('quanto fa 2+2?');
+    // The persona wrapper is not persisted — history keeps the student's words.
+    expect(result.history.at(-2)).toEqual({ role: 'user', content: 'quanto fa 2+2?' });
+  });
+
+  it('surfaces adapter failures as a model-error without a client', async () => {
+    const projectDir = await tempProject();
+    const model: ModelAdapter = {
+      ...fakeModel([]),
+      async send() {
+        throw new Error('adapter exploded');
+      },
+    };
+
+    const result = await runAgentWithModel(model, {
+      history: [],
+      prompt: 'Create the answer program.',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events: autoEvents(),
+    });
+
+    expect(result.status).toBe('model-error');
+    expect(result.finalText).toContain('adapter exploded');
   });
 });

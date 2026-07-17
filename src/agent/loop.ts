@@ -1,31 +1,32 @@
 import { stat } from 'node:fs/promises';
+import { setTimeout as sleepMs } from 'node:timers/promises';
 import type { MinervaClient } from '../api/client.js';
-import { streamChat } from '../api/chat.js';
+import { MinervaModelAdapter, type ModelAdapter } from '../model/index.js';
 import type { ChatMessage } from '../types.js';
 import { getTool, getTools } from '../tools/registry.js';
 import { resolveInProject, type Tool } from '../tools/tool.js';
 import type { AppliedChange, ChangeLog } from './context.js';
 import {
+  classifyRequest,
+  isBareAffirmation,
+  isConversationalPrompt,
+  requestRequiresExecution,
+  type RequestIntent,
+} from './intent.js';
+import {
   mergePartialWrite,
   protectedDefinitionNames,
   removedTopLevelDefinitions,
 } from './merge.js';
+import { evaluateOutput } from './oracles/index.js';
 import { parseToolCalls } from './parser.js';
 import { needsApproval, type PermissionMode } from './permissions.js';
 import { buildPreview, filePatch, readIfExists } from './preview.js';
 import type { NetChange } from './rollback.js';
-import { runReview } from './review.js';
+import { runReviewWithModel } from './review.js';
 import {
-  countedSortMismatch,
-  countdownMismatch,
-  degenerateSequenceOutput,
-  fizzBuzzMismatch,
   detectVerifyCommand,
-  primeSequenceMismatch,
-  requestRequiresExecution,
   runVerification,
-  threeNumberArithmeticMismatch,
-  threeNumberMinimumSumMismatch,
   syntaxCheckCommand,
   undefinedNameCheckCommand,
 } from './verify.js';
@@ -46,6 +47,39 @@ export const MAX_TURNS = 20;
 export const MAX_CALLS_PER_TURN = 3;
 /** Harness-run verification commands per agent run. */
 export const MAX_VERIFY_RUNS = 5;
+/** Consecutive transient model-request failures tolerated per request. */
+export const MODEL_RETRIES_PER_TURN = 2;
+const MODEL_RETRY_BACKOFF_MS = 1_500;
+
+/**
+ * One model request with the shared transient-failure policy: up to
+ * MODEL_RETRIES_PER_TURN consecutive retries with a short backoff. The
+ * request is idempotent — nothing is appended to the conversation until it
+ * succeeds. On a slow public endpoint a long run sees several independent
+ * stalls, so the budget applies per request, not per run.
+ */
+async function streamChatWithRetry(
+  model: ModelAdapter,
+  messages: ChatMessage[],
+  opts: AgentOptions,
+): Promise<{ ok: true; text: string } | { ok: false; message: string }> {
+  let retries = MODEL_RETRIES_PER_TURN;
+  for (;;) {
+    try {
+      return { ok: true, text: await model.send({ messages, signal: opts.signal }) };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (retries <= 0 || opts.signal?.aborted) {
+        opts.events.onStatus?.(`⚠ Model request failed: ${message}`);
+        return { ok: false, message };
+      }
+      retries--;
+      opts.events.onStatus?.(`⚠ Model request failed: ${message} — retrying…`);
+      // Resolve-on-abort: an aborted wait just proceeds to the aborted check.
+      await sleepMs(MODEL_RETRY_BACKOFF_MS, undefined, { signal: opts.signal }).catch(() => {});
+    }
+  }
+}
 const AGENT_ACKNOWLEDGEMENT =
   'Understood. I will act directly with the available tools, create explicitly requested new files, and verify the real result before reporting completion.';
 
@@ -53,94 +87,43 @@ const AGENT_ACKNOWLEDGEMENT =
 const VERIFYISH_COMMAND =
   /\b(?:pytest|unittest|py_compile|(?:npm|pnpm|yarn|bun)\s+(?:test|run)|vitest|jest|node --test|tsc|mypy|ruff|flake8|make|cargo (?:test|check|build)|go (?:test|build)|mvn|gradle|gcc|cc|clang|g\+\+|javac)\b/;
 
+/**
+ * The deterministic guards that can reject a tool call. A stable name per
+ * guard is what the repeated-refusal bail-out counts, so it measures "this
+ * guardrail keeps firing" rather than "this exact sentence keeps repeating".
+ */
+export type GuardName =
+  | 'truncated-write'
+  | 'required-path-substitution'
+  | 'incomplete-c-program'
+  | 'unrequested-new-file'
+  | 'unrequested-test-edit'
+  | 'definition-removal';
+
 /** Paths that look like test files (pytest/unittest/jest/vitest conventions). */
 export const TEST_FILE_PATH =
   /(^|\/)(?:test_[^/]+\.[a-z0-9]+|[^/]+_test\.[a-z0-9]+|[^/]+\.(?:test|spec)\.[a-z0-9]+)$|(^|\/)tests?\//i;
 
-const CHANGE_VERB = String.raw`(?:writ\w*|creat\w*|add\w*|updat\w*|modif\w*|fix\w*|improv\w*|generat\w*|rewrit\w*|edit\w*|chang\w*|scriv\w*|crea\w*|aggiung\w*|aggiorn\w*|modific\w*|sistem\w*|corregg\w*|genera\w*|riscriv\w*|cambi\w*)`;
-// Filler words allowed between the verb and its test-object: articles and
-// test-ish adjectives only, so "fix the bug … tests pass" does NOT match.
-const VERB_GAP = String.raw`(?:\s+(?:the|a|an|some|more|new|unit|failing|broken|existing|missing|these|those|my|our|il|i|gli|le|la|un|una|uno|dei|delle|degli|nuovi|nuove|questi|quei|mancanti|falliti)){0,3}\s+`;
-const TEST_NOUN = String.raw`(?:tests?\b|specs?\b|test\s+(?:file|case|suite)s?\b|test_\w+|\w+_test\b)`;
-
-const WANTS_TEST_CHANGES = new RegExp(`\\b${CHANGE_VERB}${VERB_GAP}${TEST_NOUN}`, 'i');
-const FORBIDS_TEST_CHANGES = new RegExp(
-  `\\b(?:(?:do\\s+not|don't|dont|never|without|non|senza)\\s+${CHANGE_VERB}${VERB_GAP}${TEST_NOUN})`,
-  'i',
-);
-const WANTS_NEW_FILES =
-  /\b(?:creat\w*|writ\w*|add\w*|generat\w*|scaffold\w*|implement\w*|build\w*|crea\w*|scriv\w*|aggiung\w*|genera\w*|implementa\w*|costru\w*)\b/i;
-const WANTS_MADE_ARTIFACT =
-  /\bmak\w*\s+(?:(?:it|this|the|a|an)\s+){0,3}(?:new\s+)?(?:file|module|program|package|script|app|component|note)\b/i;
-const FORBIDS_NEW_FILES =
-  /\b(?:do\s+not|don't|dont|never|without|non|senza)\s+(?:creat\w*|writ\w*|add\w*|generat\w*|scaffold\w*|mak\w*|crea\w*|scriv\w*|aggiung\w*|genera\w*)\b/i;
 const SOURCE_FILE_PATH = /\.(?:[cm]?[jt]sx?|py|go|rs|java|c|cc|cpp|cxx|h|hpp)$/i;
-const EXPECTS_FILE_CHANGES =
-  /\b(?:fix\w*|correct\w*|creat\w*|writ\w*|add\w*|updat\w*|modif\w*|edit\w*|chang\w*|implement\w*|refactor\w*|remove\w*|rename\w*|extend\w*|expand\w*|improv\w*|corregg\w*|sistem\w*|crea\w*|scriv\w*|aggiung\w*|aggiorn\w*|modific\w*|cambi\w*|implementa\w*|rimuov\w*|rinomina\w*|estend\w*|espand\w*|amplia\w*|miglior\w*)\b/i;
-/**
- * Exercise-style requests describe the PROGRAM's behavior instead of naming
- * a file change: "Chiedi all'utente tre numeri e sommali", "Ask the user for
- * a number and print the square". These expect code to be written too.
- */
-const PROGRAM_SPEC =
-  /\b(?:chied\w*|stamp\w*|calcol\w*|somm\w*|inser\w*|restitu\w*|print\w*|comput\w*|sum\b|input\b|output\b|ask(?:s|ing)?\b|prompt\s+the\s+user)\b/i;
-const INFORMATIONAL_REQUEST =
-  /^\s*(?:explain|review|inspect|analy[sz]e|describe|why|how|what|show\s+me|spiega|rivedi|analizza|descrivi|perch[eé]|come|cosa)\b/i;
-const ALLOWS_DEFINITION_REMOVAL =
-  /\b(?:remov\w*|delet\w*|rewrit\w*|replace\w*|refactor\w*|renam\w*|rimuov\w*|elimina\w*|riscriv\w*|sostitui\w*|rifattorizz\w*|rinomin\w*)\b/i;
-
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
-}
 
 /**
- * Does the request explicitly ask to create or change tests? Only a change
- * verb whose direct object is a test ("write tests for utils", "fix the
- * failing test", "update test_calc.py") counts. "Fix the bug so the tests
- * pass", "verify with the tests", or naming a test file as context do not.
+ * Compatibility re-exports. Prompt classification moved to ./intent.js;
+ * these keep the agent loop's published surface intact for callers and
+ * tests that predate that boundary.
  */
-export function requestAllowsTestEdit(prompt: string, testPath: string): boolean {
-  if (FORBIDS_TEST_CHANGES.test(prompt)) return false;
-  if (WANTS_TEST_CHANGES.test(prompt)) return true;
-  const base = testPath.split('/').at(-1);
-  if (!base) return false;
-  const targetsFile = new RegExp(`\\b${CHANGE_VERB}${VERB_GAP}\`?${escapeRegExp(base)}`, 'i');
-  return targetsFile.test(prompt);
-}
-
-/** A fix request may edit existing files, but must not invent unrelated ones. */
-export function requestAllowsNewFile(prompt: string): boolean {
-  return !FORBIDS_NEW_FILES.test(prompt) &&
-    (WANTS_NEW_FILES.test(prompt) || WANTS_MADE_ARTIFACT.test(prompt));
-}
-
-export function requestExpectsChanges(prompt: string): boolean {
-  return (
-    !INFORMATIONAL_REQUEST.test(prompt) &&
-    (EXPECTS_FILE_CHANGES.test(prompt) || PROGRAM_SPEC.test(prompt))
-  );
-}
-
-const EXPLICIT_SOURCE_PATH =
-  /(?:^|[\s`"'([{])((?:\.\/)?(?:[\w@+.-]+\/)*[\w@+.-]+\.(?:[cm]?[jt]sx?|py|go|rs|java|c|cc|cpp|cxx|h|hpp))(?=$|[\s`"',;:!?)\]}]|\.(?:\s|$))/gi;
-
-/** Names that appear with call parens in prose without being the target. */
-const COMMON_CALL_NAMES = new Set([
-  'print', 'input', 'println', 'printf', 'scanf', 'main', 'len', 'range',
-  'str', 'int', 'float', 'bool', 'log', 'console', 'require', 'import',
-]);
-
-/**
- * Function names the request spells out with call syntax, e.g. "add a
- * function is_even(n)". A run that never defines them did not do the task,
- * no matter how cleanly its other changes verify.
- */
-export function requestRequiredDefinitions(prompt: string): string[] {
-  const names = [...prompt.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)]
-    .map((match) => match[1])
-    .filter((name) => !COMMON_CALL_NAMES.has(name.toLowerCase()));
-  return [...new Set(names)];
-}
+export {
+  classifyRequest,
+  requestAllowsNewFile,
+  requestAllowsTestEdit,
+  requestExpectsChanges,
+  requestExplicitSourcePaths,
+  requestRequiredDefinitions,
+  requestRequiredDefinitionsWithConfidence,
+  type RequestIntent,
+  type RequiredDefinition,
+  type RequirementConfidence,
+} from './intent.js';
+export { isBareAffirmation, isConversationalPrompt, requestRequiresExecution };
 
 /** Does this file content define (not merely call) the named function? */
 export function definesIdentifier(content: string, name: string): boolean {
@@ -150,14 +133,6 @@ export function definesIdentifier(content: string, name: string): boolean {
       String.raw`|class\s+${name}\b` +
       String.raw`|\b(?:int|void|double|float|char|bool|long|unsigned)\s+\**${name}\s*\(`,
   ).test(content);
-}
-
-/** Source paths the student wrote literally in the request, in request order. */
-export function requestExplicitSourcePaths(prompt: string): string[] {
-  const paths = [...prompt.matchAll(EXPLICIT_SOURCE_PATH)].map((match) =>
-    match[1].replace(/^\.\//, ''),
-  );
-  return [...new Set(paths)];
 }
 
 export interface ToolCallEvent {
@@ -330,35 +305,83 @@ function isQuestionOnlyReply(response: string): boolean {
 }
 
 /** The request asks for a program that READS USER INPUT. */
-const EXPECTS_USER_INPUT =
-  /\b(?:chied\w*|inserisc\w*|inserire|ask(?:s|ing)?\b|prompt(?:s|ing)?\s+(?:the\s+)?user)\b/i;
-
 /** Does any changed Python file actually read from stdin? */
 function readsUserInput(contents: string[]): boolean {
   return contents.some((c) => /\binput\s*\(|\bsys\.stdin\b|\braw_input\s*\(/.test(c));
 }
 
 /**
- * "yes" / "good. write" / "va bene, procedi" — a go-ahead carrying no task
- * of its own. Every deterministic gate keyed on the prompt would otherwise
- * evaluate the affirmation as the task and disarm itself.
+ * Any file whose CONTENT a student may ask about — source, web, config,
+ * notes. A directory holding any of these keeps every message on the agent
+ * path, where the Read tool exists.
  */
-const AFFIRMATION_WORDS = new Set([
-  'yes', 'yep', 'yeah', 'ok', 'okay', 'sure', 'good', 'great', 'perfect', 'fine',
-  'go', 'ahead', 'do', 'it', 'now', 'please', 'proceed', 'continue', 'write', 'apply',
-  'si', 'sì', 'va', 'bene', 'procedi', 'continua', 'scrivi', 'scrivilo', 'fallo',
-  'applica', 'ora', 'dai', 'certo', 'perfetto',
-]);
+const CONTENT_FILE_PATH =
+  /\.(?:[cm]?[jt]sx?|py|go|rs|java|c|cc|cpp|cxx|h|hpp|rb|php|kt|swift|cs|sh|bash|zsh|html?|css|scss|sql|md|txt|json|ya?ml|toml|csv|ipynb)$/i;
 
-export function isBareAffirmation(text: string): boolean {
-  const words = text
-    .toLowerCase()
-    .replace(/[.,!;:]+/g, ' ')
-    .split(/\s+/)
-    .filter(Boolean);
-  return (
-    words.length > 0 && words.length <= 5 && words.every((word) => AFFIRMATION_WORDS.has(word))
+/**
+ * A message with no change request, no run request, and no reference to the
+ * project, code, or any file — "quanto fa 2+2?", "spiega la ricorsione" —
+ * sent from a directory that holds no readable content files (the
+ * chat-client case). The full agent scaffold (rules, tools, repository map)
+ * measurably derails a 7B on these; they get a plain chat turn instead.
+ * With content files present, even terse messages stay on the agent path:
+ * "Count x up." is a coding instruction, not small talk.
+ */
+export function isConversationalRequest(prompt: string, projectFiles: string[]): boolean {
+  if (!isConversationalPrompt(prompt)) return false;
+  if (projectFiles.some((file) => CONTENT_FILE_PATH.test(file))) return false;
+  const lower = prompt.toLowerCase();
+  return !projectFiles.some((file) => {
+    const base = file.split('/').at(-1)?.toLowerCase();
+    return base && base.length > 2 && lower.includes(base);
+  });
+}
+
+/**
+ * Plain chat turn: no agent rules, no tools, no repository context. The
+ * persona wrapper is sent to the model but NOT persisted — later agent
+ * turns must replay only the student's actual words, and a failed request
+ * must not leave an orphaned user message in history.
+ */
+async function runLightChat(
+  model: ModelAdapter,
+  opts: AgentOptions,
+  prompt: string,
+): Promise<AgentResult> {
+  const instructions = `You are Minerva, a friendly AI assistant for students, chatting in a plain terminal. ${languageInstruction(opts.language)} Answer the student's message directly and concisely.`;
+  const history = scrubStaleAssistantFences(opts.history);
+  const result = await streamChatWithRetry(
+    model,
+    [...history, { role: 'user', content: `${instructions}\n\nStudent message: ${prompt}` }],
+    opts,
   );
+  if (!result.ok) {
+    return {
+      history: opts.history,
+      finalText: result.message,
+      changes: [],
+      status: 'model-error',
+      verified: null,
+      verification: null,
+      netChanges: [],
+      pendingIntent: opts.pendingIntent ?? null,
+    };
+  }
+  opts.events.onText(result.text);
+  return {
+    history: [
+      ...history,
+      { role: 'user', content: prompt },
+      { role: 'assistant', content: result.text },
+    ],
+    finalText: result.text,
+    changes: [],
+    status: 'completed',
+    verified: null,
+    verification: null,
+    netChanges: [],
+    pendingIntent: opts.pendingIntent ?? null,
+  };
 }
 
 /** One-time correction when the model showed code but nothing was applicable. */
@@ -383,13 +406,41 @@ Updated \`${example}\`:
 Only use file paths that exist in the project listing (or clearly new files). Reply with the corrected change now.`;
 }
 
-export async function runAgent(client: MinervaClient, opts: AgentOptions): Promise<AgentResult> {
+/**
+ * The agent core, against any ModelAdapter. Nothing below reaches for a
+ * provider: every model request goes through `model.send`, and the advisory
+ * review runs on the SAME adapter, so a non-Minerva run stays non-Minerva
+ * end to end.
+ *
+ * Prompt construction is still written for the Minerva harness profile —
+ * `buildSystemPrompt` output rides in a user message because Open WebUI drops
+ * system-role messages (see ModelCapabilities.systemRole). That placement is
+ * currently unconditional. Making it capability-driven is deferred: it would
+ * change the live Minerva prompts, which are tuned against a benchmark, and
+ * no second adapter exists yet to validate the alternative against. See the
+ * note on `systemRole` in ../model/types.ts.
+ */
+export async function runAgentWithModel(
+  model: ModelAdapter,
+  opts: AgentOptions,
+): Promise<AgentResult> {
   const tools = getTools();
   const auto = opts.permissionMode === 'dontAsk';
   // "yes" carries no task: every gate below keys on the prompt, so a bare
   // go-ahead resumes the stored unfulfilled request instead.
   const prompt =
     opts.pendingIntent && isBareAffirmation(opts.prompt) ? opts.pendingIntent : opts.prompt;
+  // Every deterministic gate below judges the SAME words: classify once so a
+  // long run cannot disagree with itself halfway through.
+  const intent: RequestIntent = classifyRequest(prompt);
+  // Prompt gates first — the directory walk only runs for messages that
+  // could actually be small talk, so coding requests pay nothing extra.
+  if (
+    isConversationalPrompt(prompt) &&
+    isConversationalRequest(prompt, await listProjectFiles(opts.projectDir))
+  ) {
+    return runLightChat(model, opts, prompt);
+  }
   const selfReview = opts.review ?? auto;
   opts.events.onStatus?.('Mapping repository context…');
   const [projectContext, repoMap] = await Promise.all([
@@ -402,8 +453,8 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   // create it (for example, "fix calc.py; the error mentions missing.py").
   // Only enforce absent paths when the request actually authorizes creating
   // a file.
-  const requiredNewPaths = requestAllowsNewFile(prompt)
-    ? requestExplicitSourcePaths(prompt).filter((file) => !knownProjectFiles.has(file))
+  const requiredNewPaths = intent.allowsNewFile
+    ? intent.explicitSourcePaths.filter((file) => !knownProjectFiles.has(file))
     : [];
   const projectHasSourceFiles = projectFiles.some((file) => SOURCE_FILE_PATH.test(file));
   const { files: fileContents, skipped } = await loadProjectFileContents(
@@ -421,9 +472,14 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   // Chat Minerva's Open WebUI drops system-role messages, so the agent
   // instructions ride in a stable first user message. Refreshable repository
   // context stays in a separate turn so old file snapshots can be compacted.
-  const firstTurn = opts.history.length === 0;
+  // Detected by content, not history length: light-chat turns add history
+  // without ever injecting the agent instructions.
+  const firstTurn = !opts.history.some(
+    (message) =>
+      message.role === 'user' && message.content.includes('You are Minerva, a programming agent'),
+  );
   let initialVerification: { command: string; output: string } | undefined;
-  if (auto && firstTurn && requestExpectsChanges(prompt)) {
+  if (auto && firstTurn && intent.expectsChanges) {
     const cmd = await detectVerifyCommand(opts.projectDir, projectFiles, []);
     if (cmd && /test|pytest|unittest|\.minervacode\.md/i.test(cmd.source)) {
       const bash = getTool('Bash');
@@ -440,10 +496,10 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     }
   }
   const requestedCProgram =
-    requestRequiresExecution(prompt) &&
+    intent.requiresExecution &&
     requiredNewPaths.some((file) => /\.(?:c|cc|cpp|cxx)$/i.test(file));
   const acceptanceRequirements = requiredNewPaths.length
-    ? `\n\nHard acceptance requirement: create the exact requested path${requiredNewPaths.length === 1 ? '' : 's'} ${requiredNewPaths.join(', ')}. Do not substitute another filename.${requestRequiresExecution(prompt) ? ' This is a small standalone program: keep each file under 80 lines, use direct standard-language control flow, and emit the complete file action now before any explanation.' : ''}${requestedCProgram ? ' C/C++ hygiene: use a conventional main entry point, include every standard header you use, keep identifier casing consistent, and prefer small bounded loops and helpers over recursion, variable-length arrays, or pointer tricks.' : ''}`
+    ? `\n\nHard acceptance requirement: create the exact requested path${requiredNewPaths.length === 1 ? '' : 's'} ${requiredNewPaths.join(', ')}. Do not substitute another filename.${intent.requiresExecution ? ' This is a small standalone program: keep each file under 80 lines, use direct standard-language control flow, and emit the complete file action now before any explanation.' : ''}${requestedCProgram ? ' C/C++ hygiene: use a conventional main entry point, include every standard header you use, keep identifier casing consistent, and prefer small bounded loops and helpers over recursion, variable-length arrays, or pointer tricks.' : ''}`
     : '';
   const userContent = `${languageInstruction(opts.language)}\n\n${buildTurnPrompt({
     request: prompt,
@@ -489,14 +545,26 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   let consecutiveNoopWrites = 0;
   const verifyFailSignatures: string[] = [];
   let stuckOnIdenticalError = false;
+  // Guardrail refusals carry their own correction text; a model that trips
+  // the SAME one three times is not converging — more turns are just noise.
+  // Keyed by GUARD, not by message: the text embeds the offending path, so
+  // string keys let a model evade the bail-out by cycling filenames.
+  const refusalCounts = new Map<GuardName, number>();
+  let repeatedRefusal: string | null = null;
   let requirementsNudges = 0;
   let missingDefNudges = 0;
+  let likelyDefsWarned = false;
   let inputNudges = 0;
-  const requiredDefs = requestExpectsChanges(prompt)
-    ? requestRequiredDefinitions(prompt)
+  /** Source files a run-this request changed but no verifier could check. */
+  const unverifiableExecution = new Set<string>();
+  // Names the request demands. Only `certain` ones (an explicit "a function
+  // f(x)" cue) may fail the run; `likely` ones are inferred from bare call
+  // syntax, which prose also uses for examples — see ./intent.js.
+  const requiredDefs = intent.expectsChanges ? intent.requiredDefinitionNames : [];
+  const certainRequiredDefs = intent.expectsChanges
+    ? intent.certainRequiredDefinitions
     : [];
-  const requiresUserInput =
-    requestExpectsChanges(prompt) && EXPECTS_USER_INPUT.test(prompt);
+  const requiresUserInput = intent.expectsChanges && intent.expectsUserInput;
   let reviewed = false;
   let compactionReported = false;
 
@@ -536,21 +604,54 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   };
 
   const recordChange = (change: FileChange) => {
+    const trackedPath = change.path.replace(/^\.\//, '');
     changeSerial++;
     consecutiveNoopWrites = 0;
+    // Real progress breaks a refusal streak — only an uninterrupted run of
+    // identical refusals means the model is stuck.
+    refusalCounts.clear();
+    repeatedRefusal = null;
     changes.push({ path: change.path, patch: change.patch });
     opts.changeLog?.add({ path: change.path, patch: change.patch });
-    unverified.push(change.path);
-    const net = netState.get(change.path);
+    // `./main.py` and `main.py` are the same file. Canonicalize internal
+    // verification/net tracking so a repair with different spelling does not
+    // look like two changed Python files and fall back to a syntax-only check.
+    unverified.push(trackedPath);
+    const net = netState.get(trackedPath);
     if (net) {
       net.after = change.after;
     } else {
-      netState.set(change.path, {
+      netState.set(trackedPath, {
         before: change.before,
         after: change.after,
         existedBefore: change.existedBefore,
       });
     }
+  };
+
+  /**
+   * Reject one tool call: report it, count it against its guard, and hand
+   * the model the correction. Every guard refuses the same way, so the
+   * bail-out sees a consistent identity for each.
+   */
+  const refuse = (
+    guard: GuardName,
+    tool: Tool,
+    input: Record<string, unknown>,
+    message: string,
+    results: string[],
+  ) => {
+    opts.events.onToolEnd({
+      tool,
+      input,
+      summary: tool.summarize(input),
+      ok: false,
+      result: message,
+    });
+    const count = (refusalCounts.get(guard) ?? 0) + 1;
+    refusalCounts.set(guard, count);
+    if (count >= 3) repeatedRefusal = message;
+    results.push(formatToolResult(tool.name, message, false));
   };
 
   /**
@@ -575,8 +676,26 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     if (!cmd) {
       // No verifier applies to these paths (e.g. docs) — they can never be
       // checked, so they must not keep the run marked unverified forever.
+      // But when the request explicitly asked to RUN the result and these
+      // are source files (a language with no available toolchain), silence
+      // must not read as success: remember them and fail honestly at the end.
+      const sources = [...new Set(unverified)].filter((file) => SOURCE_FILE_PATH.test(file));
+      if (sources.length && intent.requiresExecution) {
+        for (const file of sources) unverifiableExecution.add(file);
+      }
       unverified = [];
       return false;
+    }
+
+    // A green project test/build is useful evidence, but it does not prove an
+    // explicitly requested program was actually run. Remember source files
+    // covered only by such an indirect check so they cannot leave auto mode
+    // behind a false-success result (for example main.go plus an unrelated
+    // package.json test script).
+    if (intent.requiresExecution && cmd.source !== 'compile and run') {
+      for (const file of [...new Set(unverified)]) {
+        if (SOURCE_FILE_PATH.test(file)) unverifiableExecution.add(file);
+      }
     }
 
     verifyRuns++;
@@ -588,33 +707,15 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     if (event) opts.events.onToolStart(event);
     const raw = await runVerification(cmd, opts.projectDir, opts.signal);
     // A compile-and-run pass proves the program runs, NOT that it is
-    // correct. For distinct-sequence tasks a collapse to one repeated
-    // value ("first 20 primes" → twenty 2s) is a broken generator that the
-    // exit code cannot see — treat that specific pass as a failure.
-    const degenerate =
-      raw.ok &&
-      cmd.source === 'compile and run' &&
-      degenerateSequenceOutput(prompt, raw.output);
-    const wrongPrimeSequence =
-      raw.ok &&
-      cmd.source === 'compile and run' &&
-      primeSequenceMismatch(prompt, raw.output);
-    const wrongProgramOutput =
-      raw.ok &&
-      cmd.source === 'compile and run' &&
-      (threeNumberArithmeticMismatch(prompt, raw.output) ||
-        threeNumberMinimumSumMismatch(prompt, raw.output) ||
-        countedSortMismatch(prompt, raw.output) ||
-        countdownMismatch(prompt, raw.output) ||
-        fizzBuzzMismatch(prompt, raw.output));
-    const ok = degenerate || wrongPrimeSequence || wrongProgramOutput ? false : raw.ok;
-    const output = degenerate
-      ? `${raw.output}\n\n[verification] The program ran but its output is the same number repeated — a "first N" sequence must have distinct terms. Fix the generator so it advances between terms.`
-      : wrongPrimeSequence
-        ? `${raw.output}\n\n[verification] The program ran, but it did not print the requested first prime numbers in order. Generate prime values starting at 2; do not print ordinary counting numbers.`
-      : wrongProgramOutput
-        ? `${raw.output}\n\n[verification] The program ran, but its output did not satisfy the requested result. Read the requested behavior again and produce every required value in the correct order.`
-      : raw.output;
+    // correct. The oracles catch what the exit code cannot: a "first 20
+    // primes" run emitting twenty 2s, a median() that prints the wrong
+    // number. Only a program the harness actually RAN has output to judge.
+    const verdict =
+      raw.ok && cmd.source === 'compile and run'
+        ? evaluateOutput(prompt, raw.output)
+        : null;
+    const ok = verdict ? false : raw.ok;
+    const output = verdict ? `${raw.output}\n\n${verdict.guidance}` : raw.output;
     if (event) opts.events.onToolEnd({ ...event, ok, result: output });
 
     verifyState.last = ok;
@@ -654,26 +755,15 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     return true;
   };
 
-  let modelRetries = 1;
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     compactContext();
-    let response: string;
-    try {
-      response = await streamChat(client, messages, { signal: opts.signal });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      // One transient timeout must not kill a whole run — the request is
-      // idempotent (nothing was appended to the conversation yet).
-      if (modelRetries > 0 && !opts.signal?.aborted) {
-        modelRetries--;
-        opts.events.onStatus?.(`⚠ Model request failed: ${message} — retrying once…`);
-        continue;
-      }
+    const attempt = await streamChatWithRetry(model, messages, opts);
+    if (!attempt.ok) {
       status = 'model-error';
-      finalText = message;
-      opts.events.onStatus?.(`⚠ Model request failed: ${message}`);
+      finalText = attempt.message;
       break;
     }
+    const response = attempt.text;
     messages.push({ role: 'assistant', content: response });
 
     // The code-block fallback is the primary write path for ChatMinerva —
@@ -682,7 +772,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     const { toolCalls, text, suspectTruncated } = parseToolCalls(response, {
       codeBlockWriteFallback: true,
       knownFiles: projectFiles,
-      preferredFiles: requestExpectsChanges(prompt)
+      preferredFiles: intent.expectsChanges
         ? requiredNewPaths.length
           ? requiredNewPaths
           : repoMap.contextFiles.filter((file) => !TEST_FILE_PATH.test(file))
@@ -692,7 +782,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       guessPreferredFile: !auto,
       // "Write me a script …" against an empty project: default to main.py
       // (& co.) so the first reply's code is applied instead of dropped.
-      fallbackNewFile: requestExpectsChanges(prompt),
+      fallbackNewFile: intent.expectsChanges,
       knownTools: tools.map((t) => t.name),
     });
     if (text) {
@@ -716,7 +806,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         (response.includes('```') ||
           ACTION_CLAIM.test(response) ||
           UI_CLAIM.test(response) ||
-          (requestExpectsChanges(prompt) && UNFENCED_CODE.test(response)))
+          (intent.expectsChanges && UNFENCED_CODE.test(response)))
       ) {
         nudged = true;
         messages.push({
@@ -733,7 +823,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       if (
         !questionNudged &&
         !changes.length &&
-        requestExpectsChanges(prompt) &&
+        intent.expectsChanges &&
         isQuestionOnlyReply(response)
       ) {
         questionNudged = true;
@@ -749,7 +839,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       // gets one corrected-format retry. This catches generic apologies,
       // empty/prose-only replies, and unrecognized malformed output in every
       // language without an open-ended list of refusal phrases.
-      if (!nudged && !changes.length && requestExpectsChanges(prompt)) {
+      if (!nudged && !changes.length && intent.expectsChanges) {
         nudged = true;
         messages.push({
           role: 'user',
@@ -782,15 +872,11 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       // The request spelled out function names (e.g. "add is_even(n)") that
       // no changed file defines — passing checks on OTHER lines is not the
       // task. Ask for the missing definition, then fail honestly.
-      const missingDefs =
-        auto && requiredDefs.length
-          ? requiredDefs.filter(
-              (name) =>
-                ![...netState.values()].some(
-                  (s) => definesIdentifier(s.after, name) || definesIdentifier(s.before, name),
-                ),
-            )
-          : [];
+      const isMissing = (name: string) =>
+        ![...netState.values()].some(
+          (s) => definesIdentifier(s.after, name) || definesIdentifier(s.before, name),
+        );
+      const missingDefs = auto ? requiredDefs.filter(isMissing) : [];
       if (missingDefs.length) {
         if (missingDefNudges < 2) {
           missingDefNudges++;
@@ -800,11 +886,25 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
           });
           continue;
         }
-        status = 'requirements-unmet';
-        opts.events.onStatus?.(
-          `⚠ Required function${missingDefs.length === 1 ? '' : 's'} ${missingDefs.join(', ')} ${missingDefs.length === 1 ? 'was' : 'were'} never defined.`,
-        );
-        break;
+        // Nudging is cheap and worth doing for any named function. FAILING
+        // the run is not: a `likely` requirement is inferred from bare call
+        // syntax, which prose also uses for examples and glosses, so
+        // rejecting on one would discard work that verifiably does the task.
+        // Only an explicit "a function f(x)" cue is firm enough to fail on.
+        const missingCertain = certainRequiredDefs.filter(isMissing);
+        if (missingCertain.length) {
+          status = 'requirements-unmet';
+          opts.events.onStatus?.(
+            `⚠ Required function${missingCertain.length === 1 ? '' : 's'} ${missingCertain.join(', ')} ${missingCertain.length === 1 ? 'was' : 'were'} never defined.`,
+          );
+          break;
+        }
+        if (!likelyDefsWarned) {
+          likelyDefsWarned = true;
+          opts.events.onStatus?.(
+            `⚠ The request may also have asked for ${missingDefs.join(', ')}, which the changes do not define — check whether you still need ${missingDefs.length === 1 ? 'it' : 'them'}.`,
+          );
+        }
       }
 
       // "Chiedi all'utente…" / "Ask the user…" programs must actually read
@@ -883,7 +983,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
           .map(([path, s]) => filePatch(path, s.before, s.after))
           .join('\n\n');
         try {
-          const review = await runReview(client, {
+          const review = await runReviewWithModel(model, {
             diff,
             language: opts.language,
             intent: prompt,
@@ -937,15 +1037,13 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
       if (call === truncatedCall) {
         if (auto && truncationNudges < 1) {
           truncationNudges++;
-          const refused = `Refused: your reply was cut off mid-file, so this Write to ${input.path} is likely incomplete. Resend the COMPLETE ${input.path} in one fenced code block, nothing after it.`;
-          opts.events.onToolEnd({
+          refuse(
+            'truncated-write',
             tool,
             input,
-            summary: tool.summarize(input),
-            ok: false,
-            result: refused,
-          });
-          results.push(formatToolResult(tool.name, refused, false));
+            `Refused: your reply was cut off mid-file, so this Write to ${input.path} is likely incomplete. Resend the COMPLETE ${input.path} in one fenced code block, nothing after it.`,
+            results,
+          );
           continue;
         }
         if (!auto) {
@@ -980,15 +1078,13 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         requiredNewPaths.length &&
         !requiredNewPaths.includes(normalizedInputPath)
       ) {
-        const refused = `Refused: the request explicitly requires ${requiredNewPaths.join(', ')}, not ${input.path}. Create the exact requested path and do not invent an alternative source filename.`;
-        opts.events.onToolEnd({
+        refuse(
+          'required-path-substitution',
           tool,
           input,
-          summary: tool.summarize(input),
-          ok: false,
-          result: refused,
-        });
-        results.push(formatToolResult(tool.name, refused, false));
+          `Refused: the request explicitly requires ${requiredNewPaths.join(', ')}, not ${input.path}. Create the exact requested path and do not invent an alternative source filename.`,
+          results,
+        );
         continue;
       }
 
@@ -997,20 +1093,18 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         tool.name === 'Write' &&
         normalizedInputPath &&
         requiredNewPaths.includes(normalizedInputPath) &&
-        requestRequiresExecution(prompt) &&
+        intent.requiresExecution &&
         /\.(?:c|cc|cpp|cxx)$/i.test(normalizedInputPath) &&
         typeof input.content === 'string' &&
         !/\b(?:int|void)\s+main\s*\([^)]*\)\s*\{/s.test(input.content)
       ) {
-        const refused = `Refused: ${input.path} is the requested executable program, but this Write is only a partial snippet and has no complete main function. Send the COMPLETE ${input.path} file in one Write (or use Edit for a focused replacement).`;
-        opts.events.onToolEnd({
+        refuse(
+          'incomplete-c-program',
           tool,
           input,
-          summary: tool.summarize(input),
-          ok: false,
-          result: refused,
-        });
-        results.push(formatToolResult(tool.name, refused, false));
+          `Refused: ${input.path} is the requested executable program, but this Write is only a partial snippet and has no complete main function. Send the COMPLETE ${input.path} file in one Write (or use Edit for a focused replacement).`,
+          results,
+        );
         continue;
       }
 
@@ -1020,17 +1114,15 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         typeof input.path === 'string' &&
         !knownProjectFiles.has(input.path.replace(/^\.\//, '')) &&
         projectHasSourceFiles &&
-        !requestAllowsNewFile(prompt)
+        !intent.allowsNewFile
       ) {
-        const refused = `Refused: ${input.path} does not exist and this request did not ask to create files. Fix the relevant existing source files; do not invent unrelated files.`;
-        opts.events.onToolEnd({
+        refuse(
+          'unrequested-new-file',
           tool,
           input,
-          summary: tool.summarize(input),
-          ok: false,
-          result: refused,
-        });
-        results.push(formatToolResult(tool.name, refused, false));
+          `Refused: ${input.path} does not exist and this request did not ask to create files. Fix the relevant existing source files; do not invent unrelated files.`,
+          results,
+        );
         continue;
       }
 
@@ -1042,17 +1134,15 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         (tool.name === 'Write' || tool.name === 'Edit') &&
         typeof input.path === 'string' &&
         TEST_FILE_PATH.test(input.path) &&
-        !requestAllowsTestEdit(prompt, input.path)
+        !intent.allowsTestEdit(input.path)
       ) {
-        const refused = `Refused: ${input.path} is a test file and the request did not ask to change tests. The existing tests define the expected behavior — fix the SOURCE files so they pass.`;
-        opts.events.onToolEnd({
+        refuse(
+          'unrequested-test-edit',
           tool,
           input,
-          summary: tool.summarize(input),
-          ok: false,
-          result: refused,
-        });
-        results.push(formatToolResult(tool.name, refused, false));
+          `Refused: ${input.path} is a test file and the request did not ask to change tests. The existing tests define the expected behavior — fix the SOURCE files so they pass.`,
+          results,
+        );
         continue;
       }
 
@@ -1098,7 +1188,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         typeof input.path === 'string' &&
         typeof input.content === 'string' &&
         !createdThisRun &&
-        !ALLOWS_DEFINITION_REMOVAL.test(prompt)
+        !intent.allowsDefinitionRemoval
       ) {
         try {
           const target = resolveInProject(opts.projectDir, input.path);
@@ -1108,15 +1198,13 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
             input.content,
           );
           if (removed.length) {
-            const refused = `Refused: this overwrite would delete unrelated definitions (${removed.join(', ')}). Make a focused replacement and preserve existing functions/classes.`;
-            opts.events.onToolEnd({
+            refuse(
+              'definition-removal',
               tool,
               input,
-              summary: tool.summarize(input),
-              ok: false,
-              result: refused,
-            });
-            results.push(formatToolResult(tool.name, refused, false));
+              `Refused: this overwrite would delete unrelated definitions (${removed.join(', ')}). Make a focused replacement and preserve existing functions/classes.`,
+              results,
+            );
             continue;
           }
         } catch {
@@ -1167,7 +1255,7 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         ok &&
         tool.name === 'Bash' &&
         VERIFYISH_COMMAND.test(String(input.command ?? '')) &&
-        !requestRequiresExecution(prompt)
+        !intent.requiresExecution
       ) {
         unverified = [];
         verifyState.last = true;
@@ -1191,6 +1279,17 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
         '⚠ The model re-sent content identical to the current files 3 times — stopping.',
       );
       if (verifyState.last === false) status = 'requirements-unmet';
+      break;
+    }
+
+    // Same guardrail, same refusal, three times: the model is not going to
+    // produce the demanded shape. Stop now instead of replaying the loop to
+    // the turn limit (observed live: six identical partial-snippet refusals).
+    if (auto && repeatedRefusal) {
+      status = 'requirements-unmet';
+      opts.events.onStatus?.(
+        `⚠ The same action was refused 3 times — stopping. Last refusal: ${repeatedRefusal}`,
+      );
       break;
     }
 
@@ -1251,10 +1350,20 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
   // dropped from the dirty set in harnessVerify; changes that COULD be
   // checked but were not (budget exhausted, early stop) downgrade a stale
   // true → false. Null means no verification was ever applicable.
-  const verified =
+  let verified =
     unverified.length && verifyState.last !== null ? false : verifyState.last;
 
-  if (status === 'completed' && requestExpectsChanges(prompt) && changes.length === 0) {
+  // "Compile and run it" with no way to compile or run it is a failure, not
+  // a pass-by-default (observed live: a broken .java shipped with exit 0
+  // before the harness knew Java). Never claim success that was not checked.
+  if (unverifiableExecution.size && verified !== false) {
+    verified = false;
+    opts.events.onStatus?.(
+      `⚠ The request asked to run the program, but no command actually executed ${[...unverifiableExecution].join(', ')} (the toolchain may be missing, or only unrelated test/build checks were available) — the changes are UNVERIFIED.`,
+    );
+  }
+
+  if (status === 'completed' && intent.expectsChanges && changes.length === 0) {
     status = 'no-change';
     opts.events.onStatus?.('⚠ The request expected a file change, but no applicable change was produced.');
   }
@@ -1273,8 +1382,17 @@ export async function runAgent(client: MinervaClient, opts: AgentOptions): Promi
     netChanges,
     // Unfulfilled change-expecting request: the next bare "yes" resumes it.
     pendingIntent:
-      requestExpectsChanges(prompt) && changes.length === 0 && status !== 'aborted'
+      intent.expectsChanges && changes.length === 0 && status !== 'aborted'
         ? prompt
         : null,
   };
+}
+
+/**
+ * Compatibility wrapper for callers that hold a MinervaClient. The CLI owns
+ * the client's lifecycle (model switching, re-auth), so it keeps passing one
+ * rather than an adapter.
+ */
+export async function runAgent(client: MinervaClient, opts: AgentOptions): Promise<AgentResult> {
+  return runAgentWithModel(new MinervaModelAdapter(client), opts);
 }

@@ -3,7 +3,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  canonicalCallMismatch,
   degenerateSequenceOutput,
+  fibonacciSequenceMismatch,
   primeSequenceMismatch,
   countedSortMismatch,
   countdownMismatch,
@@ -11,6 +13,7 @@ import {
   detectVerifyCommand,
   requestRequiresExecution,
   runVerification,
+  statedExpectedOutputMismatch,
   threeNumberArithmeticMismatch,
   threeNumberMinimumSumMismatch,
   syntaxCheckCommand,
@@ -670,5 +673,183 @@ describe('runVerification', () => {
     expect(result.ok).toBe(false);
     expect(result.output).toContain('bad');
     expect(result.output).toContain('exit 3');
+  });
+});
+
+describe('java verification', () => {
+  it('compiles and runs the class declaring main when execution is requested', async () => {
+    const dir = await tempProject();
+    await writeFile(
+      path.join(dir, 'Fibonacci.java'),
+      'class Fibonacci {\n    public static void main(String[] args) {\n        System.out.println(1);\n    }\n}\n',
+    );
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['Fibonacci.java'],
+      ['Fibonacci.java'],
+      undefined,
+      'Write Fibonacci.java, a Java program that prints the first 10 Fibonacci numbers. Compile and run it to show the output.',
+      async () => true,
+    );
+    expect(cmd?.command).toContain("javac -d \"$dir\" 'Fibonacci.java'");
+    expect(cmd?.command).toContain('java -cp "$dir" Fibonacci');
+    expect(cmd?.source).toBe('compile and run');
+    expect(cmd?.expectOutput).toBe(true);
+  });
+
+  it('finds main in a helper-class-first file and in sibling files', async () => {
+    const dir = await tempProject();
+    await writeFile(
+      path.join(dir, 'Lista.java'),
+      'class Nodo { int val; }\n\npublic class Lista {\n    public static void main(String[] args) {}\n}\n',
+    );
+    const helperFirst = await detectVerifyCommand(
+      dir,
+      ['Lista.java'],
+      ['Lista.java'],
+      undefined,
+      'Correggi Lista.java ed esegui il programma.',
+      async () => true,
+    );
+    expect(helperFirst?.command).toContain('java -cp "$dir" Lista');
+
+    await writeFile(
+      path.join(dir, 'Main.java'),
+      'public class Main {\n    public static void main(String[] args) { new Aiuto(); }\n}\n',
+    );
+    await writeFile(path.join(dir, 'Aiuto.java'), 'public class Aiuto {}\n');
+    const helperEdit = await detectVerifyCommand(
+      dir,
+      ['Main.java', 'Aiuto.java'],
+      ['Aiuto.java'],
+      undefined,
+      'Fix the bug in Aiuto.java and run the program.',
+      async () => true,
+    );
+    // Both files compile together; execution targets the class with main.
+    expect(helperEdit?.command).toContain("'Aiuto.java' 'Main.java'");
+    expect(helperEdit?.command).toContain('java -cp "$dir" Main');
+  });
+
+  it('compile-checks changed Java without an execution request', async () => {
+    const dir = await tempProject();
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['Contatore.java', 'Aiuto.java'],
+      ['Contatore.java', 'Aiuto.java'],
+      undefined,
+      'Fix the counter.',
+      async () => true,
+    );
+    expect(cmd?.command).toContain('javac -d');
+    expect(cmd?.command).toContain("'Contatore.java' 'Aiuto.java'");
+    expect(cmd?.source).toBe('compile check');
+  });
+
+  it('returns null for Java when no JDK is available', async () => {
+    const dir = await tempProject();
+    const cmd = await detectVerifyCommand(
+      dir,
+      ['A.java'],
+      ['A.java'],
+      undefined,
+      'Compila ed esegui A.java.',
+      async () => false,
+    );
+    expect(cmd).toBeNull();
+  });
+});
+
+describe('canonicalCallMismatch', () => {
+  const medianRequest =
+    'Create stats.py with a function median(numbers), and a main block that prints median([3, 1, 4, 1, 5]) and median([1, 2, 3, 4]). Run it and show the output.';
+
+  it('flags output missing the computable expected values', () => {
+    // The observed live failure: wrong median, printed confidently, exit 0.
+    expect(canonicalCallMismatch(medianRequest, 'Median:  4.0\nMedian:  7.0')).toBe(true);
+  });
+
+  it('accepts output containing every expected value', () => {
+    expect(canonicalCallMismatch(medianRequest, 'Median:  3\nMedian:  2.5')).toBe(false);
+  });
+
+  it('does not mistake echoed call arguments for the computed result', () => {
+    expect(canonicalCallMismatch('Print median([3, 1, 4, 1, 5]).', '[3, 1, 4, 1, 5]')).toBe(
+      true,
+    );
+    expect(canonicalCallMismatch('Print median([3,1,4,1,5]).', '[3,1,4,1,5]')).toBe(true);
+  });
+
+  it('ignores calls without literal arguments', () => {
+    expect(canonicalCallMismatch('Write a function median(numbers) for lists.', 'nothing')).toBe(
+      false,
+    );
+    expect(canonicalCallMismatch('Ask the user and print sum(values).', '42')).toBe(false);
+  });
+
+  it('handles Italian names and comma decimals', () => {
+    expect(canonicalCallMismatch('Stampa media(4, 5).', 'La media è 4,5')).toBe(false);
+    expect(canonicalCallMismatch('Stampa media(4, 5).', 'La media è 5')).toBe(true);
+    expect(canonicalCallMismatch('Stampa il fattoriale(5).', 'Risultato: 120')).toBe(false);
+    expect(canonicalCallMismatch('Stampa il fattoriale(5).', 'Risultato: 60')).toBe(true);
+  });
+
+  it('tolerates printed rounding of non-terminating results', () => {
+    expect(canonicalCallMismatch('Print mean(1, 2, 17).', 'mean = 6.67')).toBe(false);
+  });
+
+  it('flags a numeric task that printed no numbers at all', () => {
+    expect(canonicalCallMismatch('Print gcd(12, 18).', 'done!')).toBe(true);
+    expect(canonicalCallMismatch('Print gcd(12, 18).', 'gcd is 6')).toBe(false);
+  });
+});
+
+describe('statedExpectedOutputMismatch', () => {
+  const italian =
+    'Contatore.java dovrebbe stampare 5 (le vocali di "universita") ma stampa 4. Trova il bug, correggilo, poi compila ed esegui per mostrare l\'output.';
+
+  it('trusts only the should-print value, not the reported wrong one', () => {
+    expect(statedExpectedOutputMismatch(italian, 'Numero di vocali: 9')).toBe(true);
+    expect(statedExpectedOutputMismatch(italian, 'Numero di vocali: 5')).toBe(false);
+  });
+
+  it('handles english phrasing and no-output runs', () => {
+    const english = 'somma.cpp should print 5050 but prints something else. Fix and run it.';
+    expect(statedExpectedOutputMismatch(english, 'La somma è 4950')).toBe(true);
+    expect(statedExpectedOutputMismatch(english, 'La somma è 5050')).toBe(false);
+    expect(statedExpectedOutputMismatch(english, 'done')).toBe(true);
+  });
+
+  it('stays silent when no expected value is stated', () => {
+    expect(statedExpectedOutputMismatch('Fix the bug in utils.py.', 'whatever')).toBe(false);
+    expect(
+      statedExpectedOutputMismatch('The program should print the first primes.', '2 3 5 7'),
+    ).toBe(false);
+  });
+});
+
+describe('fibonacciSequenceMismatch', () => {
+  const request =
+    'Write Fibonacci.java, a Java program that prints the first 10 Fibonacci numbers (starting 0 1) separated by spaces on one line. Compile and run it to show the output.';
+
+  it('flags truncated or wrong sequences', () => {
+    // Observed live: program verified while printing only two terms.
+    expect(fibonacciSequenceMismatch(request, 'First 10 terms:\n0 1')).toBe(true);
+    expect(fibonacciSequenceMismatch(request, '0 1 2 3 4 5 6 7 8 9')).toBe(true);
+  });
+
+  it('honours an explicitly requested zero start', () => {
+    expect(fibonacciSequenceMismatch(request, '0 1 1 2 3 5 8 13 21 34')).toBe(false);
+    expect(fibonacciSequenceMismatch(request, '1 1 2 3 5 8 13 21 34 55')).toBe(true);
+  });
+
+  it('accepts both classic starting conventions when the request is ambiguous', () => {
+    const ambiguous = 'Print the first 10 Fibonacci numbers.';
+    expect(fibonacciSequenceMismatch(ambiguous, '0 1 1 2 3 5 8 13 21 34')).toBe(false);
+    expect(fibonacciSequenceMismatch(ambiguous, '1 1 2 3 5 8 13 21 34 55')).toBe(false);
+  });
+
+  it('stays silent without an explicit count', () => {
+    expect(fibonacciSequenceMismatch('Print some Fibonacci numbers.', '0 1')).toBe(false);
   });
 });

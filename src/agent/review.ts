@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import type { MinervaClient } from '../api/client.js';
-import { streamChat } from '../api/chat.js';
+import { MinervaModelAdapter, type ModelAdapter } from '../model/index.js';
 import type { ChatMessage } from '../types.js';
 import { filePatch } from './preview.js';
 import { languageInstruction, type AgentLanguage } from './prompts.js';
@@ -106,21 +106,36 @@ export interface ReviewOptions {
   signal?: AbortSignal;
 }
 
-/** One-shot review call: fresh conversation, reviewer instructions only. */
-export async function runReview(
-  client: MinervaClient,
+/**
+ * One-shot review call: fresh conversation, reviewer instructions only.
+ * Provider-independent — whatever adapter the agent is running on reviews
+ * its own changes, so a non-Minerva run stays non-Minerva through review.
+ */
+export async function runReviewWithModel(
+  model: ModelAdapter,
   options: ReviewOptions,
 ): Promise<ReviewResult> {
   const messages: ChatMessage[] = [
     { role: 'user', content: buildReviewPrompt(options.diff, options.language, options.intent) },
   ];
-  const raw = (await streamChat(client, messages, { signal: options.signal })).trim();
+  const raw = (await model.send({ messages, signal: options.signal })).trim();
   const findings = parseReviewFindings(raw);
   return {
     raw,
     findings,
     hasBugs: findings.some((f) => f.severity === 'bug'),
   };
+}
+
+/**
+ * Compatibility wrapper for callers that hold a MinervaClient. The CLI owns
+ * the client's lifecycle (model switching, re-auth), so it keeps passing one.
+ */
+export async function runReview(
+  client: MinervaClient,
+  options: ReviewOptions,
+): Promise<ReviewResult> {
+  return runReviewWithModel(new MinervaModelAdapter(client), options);
 }
 
 const MAX_UNTRACKED_FILES = 20;
