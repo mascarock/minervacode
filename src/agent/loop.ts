@@ -62,11 +62,22 @@ async function streamChatWithRetry(
   model: ModelAdapter,
   messages: ChatMessage[],
   opts: AgentOptions,
-): Promise<{ ok: true; text: string } | { ok: false; message: string }> {
+): Promise<
+  { ok: true; text: string; sources: unknown[] } | { ok: false; message: string }
+> {
   let retries = MODEL_RETRIES_PER_TURN;
   for (;;) {
     try {
-      return { ok: true, text: await model.send({ messages, signal: opts.signal }) };
+      const sources: unknown[] = [];
+      const text = await model.send(
+        { messages, signal: opts.signal, webSearch: opts.webSearch },
+        opts.webSearch
+          ? (event) => {
+              if (event.type === 'sources') sources.push(...event.sources);
+            }
+          : undefined,
+      );
+      return { ok: true, text, sources };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (retries <= 0 || opts.signal?.aborted) {
@@ -79,6 +90,40 @@ async function streamChatWithRetry(
       await sleepMs(MODEL_RETRY_BACKOFF_MS, undefined, { signal: opts.signal }).catch(() => {});
     }
   }
+}
+
+/**
+ * Best-effort URLs out of Open WebUI's `sources` payload shape (an array of
+ * `{ source: { urls: [...] }, ... }` entries). Falls back to a bare count
+ * when the shape does not match — still proof search ran, just not which.
+ */
+function summarizeSources(sources: unknown[]): string {
+  const urls = new Set<string>();
+  for (const entry of sources) {
+    const list = (entry as { source?: { urls?: unknown } } | null)?.source?.urls;
+    if (Array.isArray(list)) {
+      for (const url of list) if (typeof url === 'string') urls.add(url);
+    }
+  }
+  if (!urls.size) return `${sources.length} source${sources.length === 1 ? '' : 's'}`;
+  const shown = [...urls].slice(0, 5);
+  return shown.join(', ') + (urls.size > shown.length ? `, +${urls.size - shown.length} more` : '');
+}
+
+/**
+ * `webSearch: true` only means the CLI ASKED Open WebUI to search — the
+ * server silently ignores the flag when the capability is missing on the
+ * account, the model, or the instance config. A `sources` SSE line is the
+ * only proof a search tool actually ran; its absence must be reported as
+ * loudly as a failed verification, not assumed away.
+ */
+function reportWebSearch(opts: AgentOptions, sources: unknown[]): void {
+  if (!opts.webSearch) return;
+  opts.events.onStatus?.(
+    sources.length
+      ? `🔎 Web search ran: ${summarizeSources(sources)}`
+      : '⚠ Web search was requested but the server returned no sources for this turn — it was likely ignored (check that web search is enabled for this model on Chat Minerva).',
+  );
 }
 const AGENT_ACKNOWLEDGEMENT =
   'Understood. I will act directly with the available tools, create explicitly requested new files, and verify the real result before reporting completion.';
@@ -164,6 +209,12 @@ export interface AgentOptions {
   permissionMode: PermissionMode;
   /** Reply language. Auto follows the language of the latest user message. */
   language?: AgentLanguage;
+  /**
+   * Open WebUI web search for this run (`features.web_search`). Off by
+   * default — the Chat Minerva 7B often lacks the capability and search
+   * adds latency even when the server supports it.
+   */
+  webSearch?: boolean;
   /** Self-review applied changes before finishing. Defaults on in auto mode. */
   review?: boolean;
   events: AgentEvents;
@@ -367,6 +418,7 @@ async function runLightChat(
       pendingIntent: opts.pendingIntent ?? null,
     };
   }
+  reportWebSearch(opts, result.sources);
   opts.events.onText(result.text);
   return {
     history: [
@@ -764,6 +816,7 @@ export async function runAgentWithModel(
       break;
     }
     const response = attempt.text;
+    reportWebSearch(opts, attempt.sources);
     messages.push({ role: 'assistant', content: response });
 
     // The code-block fallback is the primary write path for ChatMinerva —

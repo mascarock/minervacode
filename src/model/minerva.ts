@@ -34,7 +34,9 @@ export class MinervaModelAdapter implements ModelAdapter {
       timeoutMs: request.timeoutMs,
       temperature: request.temperature,
       maxTokens: request.maxTokens,
+      webSearch: request.webSearch,
       onChunk: onEvent ? (chunk) => onEvent({ type: 'text', text: chunk }) : undefined,
+      onSources: onEvent ? (sources) => onEvent({ type: 'sources', sources }) : undefined,
     });
     onEvent?.({ type: 'done', text });
     return text;

@@ -39,6 +39,10 @@ interface MainOptions {
   projectDir: string;
   permissionMode?: PermissionMode;
   language: AgentLanguage;
+  // Commander derives the options-object key from the flag's long name:
+  // `.option('--web', …)` lands in `opts.web`, NOT `opts.webSearch`. Keep
+  // this aligned with the flag string below, or --web silently no-ops.
+  web?: boolean;
   init?: boolean;
   headless?: boolean;
 }
@@ -49,6 +53,7 @@ function agentSettings(opts: MainOptions): AgentSettings {
     auto: opts.auto ?? false,
     permissionMode: opts.permissionMode,
     language: opts.language,
+    webSearch: opts.web ?? false,
   };
 }
 
@@ -80,6 +85,7 @@ program
   .option('--project-dir <dir>', 'Project root the agent works in', process.cwd())
   .option('--permission-mode <mode>', 'default | acceptEdits | dontAsk', parsePermissionMode)
   .option('--language <language>', 'Reply language: auto | en | it', parseLanguage, 'auto')
+  .option('--web', 'Enable Open WebUI web search for model requests (requires server support)')
   .option('--init', `Scaffold a ${PROJECT_CONTEXT_FILE} project context file and exit`)
   .option('--headless', 'Run browser login headless')
   .action(async (prompt: string | undefined, opts: MainOptions) => {

@@ -1,6 +1,6 @@
 {
   "name": "minervacode",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Terminal coding companion for Chat Minerva — propose, approve, and verify code changes from the CLI",
   "license": "MIT",
   "author": "Mascarock",

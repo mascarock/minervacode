@@ -50,6 +50,7 @@ export const HELP_LINES = [
   '/auto    toggle experimental auto mode (on|off) — assisted asks before changes',
   '/dir     show or change the project directory the agent works in',
   '/language set reply language (auto|en|it)',
+  '/web     toggle Open WebUI web search (on|off)',
   '/repomap show the ranked repository structure (/repomap <focus>)',
   '/context show context use and compact old bulk if needed',
   '/tools   list agent tools',

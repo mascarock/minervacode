@@ -19,3 +19,8 @@ export async function getModel(client: MinervaClient, modelId: string): Promise<
 export async function getDefaultModel(client: MinervaClient): Promise<ModelInfo | null> {
   return getModel(client, client.model || DEFAULT_MODEL);
 }
+
+/** True when Open WebUI advertises web search for this model. */
+export function modelSupportsWebSearch(model: ModelInfo | null | undefined): boolean {
+  return model?.info?.meta?.capabilities?.web_search === true;
+}

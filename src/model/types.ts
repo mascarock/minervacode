@@ -34,14 +34,20 @@ export interface ModelRequest {
   readonly timeoutMs?: number;
   readonly temperature?: number;
   readonly maxTokens?: number;
+  /** Open WebUI per-request web search toggle. */
+  readonly webSearch?: boolean;
 }
 
 /**
  * Streaming progress. `text` events are incremental; `done` carries the
- * complete response, so a consumer may ignore chunks entirely.
+ * complete response, so a consumer may ignore chunks entirely. `sources`
+ * is the honest signal that a server-side tool (web search, RAG) actually
+ * ran for this request — its absence when `webSearch` was requested means
+ * the provider ignored the flag, not that the model chose not to search.
  */
 export type ModelEvent =
   | { readonly type: 'text'; readonly text: string }
+  | { readonly type: 'sources'; readonly sources: readonly unknown[] }
   | { readonly type: 'done'; readonly text: string };
 
 /**

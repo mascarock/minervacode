@@ -42,6 +42,8 @@ export interface AgentSettings {
   /** Explicit --permission-mode; when unset it follows the auto toggle. */
   permissionMode?: PermissionMode;
   language: AgentLanguage;
+  /** Open WebUI web search (`features.web_search`) for each model request. */
+  webSearch: boolean;
 }
 
 interface AppProps {
@@ -56,6 +58,7 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
   const { exit } = useApp();
   const [auto, setAuto] = useState(agent.auto);
   const [language, setLanguage] = useState<AgentLanguage>(agent.language);
+  const [webSearch, setWebSearch] = useState(agent.webSearch);
   const [projectDir, setProjectDir] = useState(agent.projectDir);
   const [entries, setEntries] = useState<Entry[]>([
     {
@@ -63,7 +66,7 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
       kind: 'welcome',
       info: sessionInfo,
       extra: [
-        `agent: ${agent.auto ? 'auto' : 'assisted'} · language: ${agent.language} · dir: ${agent.projectDir}`,
+        `agent: ${agent.auto ? 'auto' : 'assisted'} · language: ${agent.language}${agent.webSearch ? ' · web search' : ''} · dir: ${agent.projectDir}`,
       ],
     },
   ]);
@@ -114,6 +117,7 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
         projectDir,
         permissionMode: permissionMode(),
         language,
+        webSearch,
         signal: controller.signal,
         changeLog: changeLogRef.current,
         events: {
@@ -238,6 +242,24 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
       }
       setLanguage(next);
       return push({ kind: 'system', text: `Reply language set to ${next}.` });
+    }
+
+    if (cmd === '/web') {
+      const next = arg === 'on' ? true : arg === 'off' ? false : !webSearch;
+      setWebSearch(next);
+      const cap = sessionInfo.model?.info?.meta?.capabilities?.web_search;
+      if (next && !cap) {
+        return push({
+          kind: 'system',
+          text: 'Web search on for this session, but the current model does not advertise web_search — Open WebUI may ignore the request until an admin enables it on Chat Minerva.',
+        });
+      }
+      return push({
+        kind: 'system',
+        text: next
+          ? 'Web search on — Open WebUI will fetch web results for each model request.'
+          : 'Web search off.',
+      });
     }
 
     if (cmd === '/tools') {

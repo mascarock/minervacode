@@ -3,6 +3,7 @@ import { render } from 'ink';
 import { MinervaClient } from './api/client.js';
 import type { MinervaConfig } from './types.js';
 import { validateSession } from './api/auth.js';
+import { modelSupportsWebSearch, getDefaultModel } from './api/models.js';
 import { runAgent } from './agent/loop.js';
 import { ChangeLog } from './agent/context.js';
 import { revertNetChanges } from './agent/rollback.js';
@@ -82,12 +83,23 @@ export async function runChatOnce(
 ): Promise<boolean> {
   const changeLog = new ChangeLog();
   const permissionMode = agent.permissionMode ?? (agent.auto ? 'dontAsk' : 'default');
+  if (agent.webSearch) {
+    const model = await getDefaultModel(client);
+    if (!modelSupportsWebSearch(model)) {
+      console.log(
+        chalk.yellow(
+          '  ⚠ --web is on, but the current model does not advertise web_search — Open WebUI may ignore it until an admin enables it on Chat Minerva.',
+        ),
+      );
+    }
+  }
   const result = await runAgent(client, {
     history: [],
     prompt,
     projectDir: agent.projectDir,
     permissionMode,
     language: agent.language,
+    webSearch: agent.webSearch,
     events: consoleAgentEvents(),
     changeLog,
   });

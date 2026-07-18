@@ -3,6 +3,13 @@ import type { ChatMessage } from '../types.js';
 
 export interface StreamChatOptions {
   onChunk?: (text: string) => void;
+  /**
+   * Open WebUI emits a standalone SSE data line — a top-level `sources`
+   * field, not nested under `choices` — when a web-search (or RAG) tool
+   * actually ran for this turn. Absence of this callback firing is the
+   * honest signal that `webSearch: true` was ignored server-side.
+   */
+  onSources?: (sources: unknown[]) => void;
   signal?: AbortSignal;
   /**
    * Inactivity bound: the request fails when NO bytes arrive for this long.
@@ -13,6 +20,12 @@ export interface StreamChatOptions {
   /** Overrides the agent-tuned default; see the sampling note below. */
   temperature?: number;
   maxTokens?: number;
+  /**
+   * Ask Open WebUI to run its web-search pipeline for this chat turn
+   * (`features.web_search`). Requires the feature to be enabled on the
+   * server, on the model, and for the user's account.
+   */
+  webSearch?: boolean;
 }
 
 /**
@@ -36,10 +49,12 @@ export async function streamChat(
 ): Promise<string> {
   const {
     onChunk,
+    onSources,
     signal,
     timeoutMs = 60_000,
     temperature = DEFAULT_TEMPERATURE,
     maxTokens = DEFAULT_MAX_TOKENS,
+    webSearch = false,
   } = options;
   const idle = new AbortController();
   let idleTimer: NodeJS.Timeout | undefined;
@@ -61,6 +76,7 @@ export async function streamChat(
           stream: true,
           temperature,
           max_tokens: maxTokens,
+          ...(webSearch ? { features: { web_search: true } } : {}),
         },
         requestSignal,
       );
@@ -101,7 +117,15 @@ export async function streamChat(
           try {
             const parsed = JSON.parse(payload) as {
               choices?: Array<{ delta?: { content?: string } }>;
+              sources?: unknown[];
             };
+            // A `sources` line stands alone (no `choices`) — it is Open
+            // WebUI reporting that a tool (web search, RAG) actually ran,
+            // not a text delta. See streaming/index.ts in open-webui/open-webui.
+            if (parsed.sources) {
+              onSources?.(parsed.sources);
+              continue;
+            }
             const chunk = parsed.choices?.[0]?.delta?.content ?? '';
             if (chunk) {
               fullText += chunk;

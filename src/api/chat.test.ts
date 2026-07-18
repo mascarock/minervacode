@@ -21,6 +21,51 @@ describe('streamChat', () => {
       temperature: 0.1,
       max_tokens: 2048,
     });
+    expect(request).not.toHaveProperty('features');
+  });
+
+  it('enables Open WebUI web search when requested', async () => {
+    let request: Record<string, unknown> | undefined;
+    const client = {
+      model: 'test-model',
+      async postStream(_path: string, body: unknown) {
+        request = body as Record<string, unknown>;
+        const chunk = JSON.stringify({ choices: [{ delta: { content: 'ok' } }] });
+        return new Response(`data: ${chunk}\n\ndata: [DONE]\n\n`, { status: 200 });
+      },
+    } as MinervaClient;
+
+    await expect(
+      streamChat(client, [{ role: 'user', content: 'Latest news?' }], { webSearch: true }),
+    ).resolves.toBe('ok');
+    expect(request).toMatchObject({ features: { web_search: true } });
+  });
+
+  it('reports sources via onSources instead of treating them as text', async () => {
+    const client = {
+      model: 'test-model',
+      async postStream(_path: string, _body: unknown) {
+        const textChunk = JSON.stringify({ choices: [{ delta: { content: 'answer' } }] });
+        const sourcesChunk = JSON.stringify({
+          sources: [{ source: { urls: ['https://example.com/a', 'https://example.com/b'] } }],
+        });
+        return new Response(
+          `data: ${sourcesChunk}\n\ndata: ${textChunk}\n\ndata: [DONE]\n\n`,
+          { status: 200 },
+        );
+      },
+    } as MinervaClient;
+
+    const sources: unknown[] = [];
+    await expect(
+      streamChat(client, [{ role: 'user', content: 'Latest news?' }], {
+        webSearch: true,
+        onSources: (s) => sources.push(...s),
+      }),
+    ).resolves.toBe('answer');
+    expect(sources).toEqual([
+      { source: { urls: ['https://example.com/a', 'https://example.com/b'] } },
+    ]);
   });
 
   it('bounds a stalled model response', async () => {

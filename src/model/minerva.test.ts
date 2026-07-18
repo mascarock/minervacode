@@ -71,8 +71,27 @@ describe('MinervaModelAdapter', () => {
         return sseResponse(['ok']);
       }),
     );
-    await adapter.send({ messages: [], temperature: 0.7, maxTokens: 16 });
-    expect(body).toMatchObject({ temperature: 0.7, max_tokens: 16 });
+    await adapter.send({ messages: [], temperature: 0.7, maxTokens: 16, webSearch: true });
+    expect(body).toMatchObject({ temperature: 0.7, max_tokens: 16, features: { web_search: true } });
+  });
+
+  it('forwards Open WebUI sources as a distinct event, not text', async () => {
+    const adapter = new MinervaModelAdapter(
+      stubClient(async (_path, _body) => {
+        const sourcesChunk = JSON.stringify({ sources: [{ source: { urls: ['https://x'] } }] });
+        const textChunk = JSON.stringify({ choices: [{ delta: { content: 'hi' } }] });
+        return new Response(`data: ${sourcesChunk}\n\ndata: ${textChunk}\n\ndata: [DONE]\n\n`, {
+          status: 200,
+        });
+      }),
+    );
+    const events: ModelEvent[] = [];
+    await adapter.send({ messages: [], webSearch: true }, (event) => events.push(event));
+    expect(events).toEqual([
+      { type: 'sources', sources: [{ source: { urls: ['https://x'] } }] },
+      { type: 'text', text: 'hi' },
+      { type: 'done', text: 'hi' },
+    ]);
   });
 
   it('propagates transport failures to the caller', async () => {

@@ -1943,6 +1943,81 @@ describe('conversational light chat routing', () => {
   });
 });
 
+describe('web search reporting', () => {
+  it('warns honestly when the server ignores the web-search request', async () => {
+    const projectDir = await tempProject();
+    const client = stubClient(async () => sseResponse('4'));
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+
+    const result = await runAgent(client, {
+      history: [],
+      prompt: 'Quanto fa 2+2?',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      webSearch: true,
+      events,
+    });
+
+    expect(result.status).toBe('completed');
+    expect(
+      statuses.some((s) => s.startsWith('⚠') && /web search/i.test(s) && /no sources/i.test(s)),
+    ).toBe(true);
+  });
+
+  it('reports the sources Open WebUI actually used', async () => {
+    const projectDir = await tempProject();
+    const client = stubClient(async () => {
+      const sourcesChunk = JSON.stringify({
+        sources: [{ source: { urls: ['https://example.com/docs'] } }],
+      });
+      const textChunk = JSON.stringify({ choices: [{ delta: { content: 'It is 4.' } }] });
+      return new Response(`data: ${sourcesChunk}\n\ndata: ${textChunk}\n\ndata: [DONE]\n\n`, {
+        status: 200,
+      });
+    });
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+
+    const result = await runAgent(client, {
+      history: [],
+      prompt: 'Quanto fa 2+2?',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      webSearch: true,
+      events,
+    });
+
+    expect(result.status).toBe('completed');
+    expect(statuses.some((s) => s.includes('🔎') && s.includes('https://example.com/docs'))).toBe(
+      true,
+    );
+  });
+
+  it('says nothing about search when it was never requested', async () => {
+    const projectDir = await tempProject();
+    const client = mockClient(['4']);
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+
+    await runAgent(client, {
+      history: [],
+      prompt: 'Quanto fa 2+2?',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      events,
+    });
+
+    expect(statuses.some((s) => /web search/i.test(s))).toBe(false);
+  });
+});
+
 describe('repeated refusal bail-out', () => {
   it('stops after the same guardrail refuses three times', async () => {
     const projectDir = await tempProject();
