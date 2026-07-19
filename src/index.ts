@@ -85,7 +85,7 @@ program
   .option('--project-dir <dir>', 'Project root the agent works in', process.cwd())
   .option('--permission-mode <mode>', 'default | acceptEdits | dontAsk', parsePermissionMode)
   .option('--language <language>', 'Reply language: auto | en | it', parseLanguage, 'auto')
-  .option('--web', 'Enable Open WebUI web search for model requests (requires server support)')
+  .option('--web', 'Fetch web results locally each turn and inject them into the prompt (backend: MINERVA_SEARCH_PROVIDER, default duckduckgo)')
   .option('--init', `Scaffold a ${PROJECT_CONTEXT_FILE} project context file and exit`)
   .option('--headless', 'Run browser login headless')
   .action(async (prompt: string | undefined, opts: MainOptions) => {

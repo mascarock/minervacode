@@ -3,7 +3,6 @@ import { render } from 'ink';
 import { MinervaClient } from './api/client.js';
 import type { MinervaConfig } from './types.js';
 import { validateSession } from './api/auth.js';
-import { modelSupportsWebSearch, getDefaultModel } from './api/models.js';
 import { runAgent } from './agent/loop.js';
 import { ChangeLog } from './agent/context.js';
 import { revertNetChanges } from './agent/rollback.js';
@@ -83,16 +82,8 @@ export async function runChatOnce(
 ): Promise<boolean> {
   const changeLog = new ChangeLog();
   const permissionMode = agent.permissionMode ?? (agent.auto ? 'dontAsk' : 'default');
-  if (agent.webSearch) {
-    const model = await getDefaultModel(client);
-    if (!modelSupportsWebSearch(model)) {
-      console.log(
-        chalk.yellow(
-          '  ⚠ --web is on, but the current model does not advertise web_search — Open WebUI may ignore it until an admin enables it on Chat Minerva.',
-        ),
-      );
-    }
-  }
+  // Web search runs client-side now (the agent emits its own 🔎 status per
+  // turn), so no server-capability warning is needed here.
   const result = await runAgent(client, {
     history: [],
     prompt,

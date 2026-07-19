@@ -247,17 +247,11 @@ export function App({ client, config: initialConfig, sessionInfo, agent, onActio
     if (cmd === '/web') {
       const next = arg === 'on' ? true : arg === 'off' ? false : !webSearch;
       setWebSearch(next);
-      const cap = sessionInfo.model?.info?.meta?.capabilities?.web_search;
-      if (next && !cap) {
-        return push({
-          kind: 'system',
-          text: 'Web search on for this session, but the current model does not advertise web_search — Open WebUI may ignore the request until an admin enables it on Chat Minerva.',
-        });
-      }
+      const provider = (process.env.MINERVA_SEARCH_PROVIDER ?? 'duckduckgo').toLowerCase();
       return push({
         kind: 'system',
         text: next
-          ? 'Web search on — Open WebUI will fetch web results for each model request.'
+          ? `Web search on — results are fetched locally each turn (backend: ${provider}) and injected into the prompt. Change with MINERVA_SEARCH_PROVIDER=duckduckgo|tavily|searxng|brave.`
           : 'Web search off.',
       });
     }

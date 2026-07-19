@@ -1944,7 +1944,7 @@ describe('conversational light chat routing', () => {
 });
 
 describe('web search reporting', () => {
-  it('warns honestly when the server ignores the web-search request', async () => {
+  it('warns honestly when the local search returns nothing', async () => {
     const projectDir = await tempProject();
     const client = stubClient(async () => sseResponse('4'));
     const statuses: string[] = [];
@@ -1958,25 +1958,23 @@ describe('web search reporting', () => {
       permissionMode: 'dontAsk',
       language: 'en',
       webSearch: true,
+      // Provider that finds nothing — the honest "no results" path.
+      searchProvider: { id: 'stub', search: async () => [] },
       events,
     });
 
     expect(result.status).toBe('completed');
     expect(
-      statuses.some((s) => s.startsWith('⚠') && /web search/i.test(s) && /no sources/i.test(s)),
+      statuses.some((s) => s.startsWith('⚠') && /web search/i.test(s) && /no results/i.test(s)),
     ).toBe(true);
   });
 
-  it('reports the sources Open WebUI actually used', async () => {
+  it('reports and injects the results the local search returned', async () => {
     const projectDir = await tempProject();
-    const client = stubClient(async () => {
-      const sourcesChunk = JSON.stringify({
-        sources: [{ source: { urls: ['https://example.com/docs'] } }],
-      });
-      const textChunk = JSON.stringify({ choices: [{ delta: { content: 'It is 4.' } }] });
-      return new Response(`data: ${sourcesChunk}\n\ndata: ${textChunk}\n\ndata: [DONE]\n\n`, {
-        status: 200,
-      });
+    const requests: Array<{ messages: Array<{ content: string }> }> = [];
+    const client = stubClient(async (_path, body) => {
+      requests.push(body as { messages: Array<{ content: string }> });
+      return sseResponse('It is 4.');
     });
     const statuses: string[] = [];
     const events = autoEvents();
@@ -1989,13 +1987,44 @@ describe('web search reporting', () => {
       permissionMode: 'dontAsk',
       language: 'en',
       webSearch: true,
+      searchProvider: {
+        id: 'stub',
+        search: async () => [
+          { title: 'Docs', url: 'https://example.com/docs', snippet: 'The answer is four.' },
+        ],
+      },
       events,
     });
 
     expect(result.status).toBe('completed');
+    // Reported to the user…
     expect(statuses.some((s) => s.includes('🔎') && s.includes('https://example.com/docs'))).toBe(
       true,
     );
+    // …and actually injected into the prompt the model received.
+    const sent = requests.flatMap((r) => r.messages.map((m) => m.content)).join('\n');
+    expect(sent).toContain('https://example.com/docs');
+  });
+
+  it('does not search when a null provider disables it', async () => {
+    const projectDir = await tempProject();
+    const client = stubClient(async () => sseResponse('4'));
+    const statuses: string[] = [];
+    const events = autoEvents();
+    events.onStatus = (text) => statuses.push(text);
+
+    await runAgent(client, {
+      history: [],
+      prompt: 'Quanto fa 2+2?',
+      projectDir,
+      permissionMode: 'dontAsk',
+      language: 'en',
+      webSearch: true,
+      searchProvider: null,
+      events,
+    });
+
+    expect(statuses.some((s) => /web search/i.test(s) || s.includes('🔎'))).toBe(false);
   });
 
   it('says nothing about search when it was never requested', async () => {

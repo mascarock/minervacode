@@ -1,6 +1,11 @@
 import { stat } from 'node:fs/promises';
 import { setTimeout as sleepMs } from 'node:timers/promises';
 import type { MinervaClient } from '../api/client.js';
+import {
+  resolveWebSearchProvider,
+  type WebSearchProvider,
+  type WebSearchResult,
+} from '../api/websearch.js';
 import { MinervaModelAdapter, type ModelAdapter } from '../model/index.js';
 import type { ChatMessage } from '../types.js';
 import { getTool, getTools } from '../tools/registry.js';
@@ -36,6 +41,7 @@ import {
   buildSystemPrompt,
   buildTurnPrompt,
   formatToolResult,
+  formatWebResults,
   languageInstruction,
   listProjectFiles,
   loadProjectContext,
@@ -62,22 +68,15 @@ async function streamChatWithRetry(
   model: ModelAdapter,
   messages: ChatMessage[],
   opts: AgentOptions,
-): Promise<
-  { ok: true; text: string; sources: unknown[] } | { ok: false; message: string }
-> {
+): Promise<{ ok: true; text: string } | { ok: false; message: string }> {
   let retries = MODEL_RETRIES_PER_TURN;
   for (;;) {
     try {
-      const sources: unknown[] = [];
-      const text = await model.send(
-        { messages, signal: opts.signal, webSearch: opts.webSearch },
-        opts.webSearch
-          ? (event) => {
-              if (event.type === 'sources') sources.push(...event.sources);
-            }
-          : undefined,
-      );
-      return { ok: true, text, sources };
+      // Web search is served client-side (see gatherWebContext): results are
+      // already injected into `messages`, so the provider is not asked to run
+      // its own native search here.
+      const text = await model.send({ messages, signal: opts.signal });
+      return { ok: true, text };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       if (retries <= 0 || opts.signal?.aborted) {
@@ -111,19 +110,62 @@ function summarizeSources(sources: unknown[]): string {
 }
 
 /**
- * `webSearch: true` only means the CLI ASKED Open WebUI to search — the
- * server silently ignores the flag when the capability is missing on the
- * account, the model, or the instance config. A `sources` SSE line is the
- * only proof a search tool actually ran; its absence must be reported as
- * loudly as a failed verification, not assumed away.
+ * Report what the local search actually returned. Empty is reported as
+ * loudly as a failed verification: it means the provider was unreachable,
+ * rate-limited, or found nothing — not that the model chose not to search.
  */
 function reportWebSearch(opts: AgentOptions, sources: unknown[]): void {
   if (!opts.webSearch) return;
   opts.events.onStatus?.(
     sources.length
-      ? `🔎 Web search ran: ${summarizeSources(sources)}`
-      : '⚠ Web search was requested but the server returned no sources for this turn — it was likely ignored (check that web search is enabled for this model on Chat Minerva).',
+      ? `🔎 Web search: ${summarizeSources(sources)}`
+      : '⚠ Web search returned no results this turn — the provider may be unreachable or rate-limited (set MINERVA_SEARCH_PROVIDER to switch backends).',
   );
+}
+
+/** Results injected per turn — kept small so the 7B is grounded, not swamped. */
+const WEB_SEARCH_MAX_RESULTS = 5;
+
+/**
+ * Retrieve web results client-side and shape them for prompt injection. The
+ * server has web search disabled, so the agent does the search itself and
+ * feeds results in as context. Returns the results (for injection) and the
+ * Open WebUI `sources` shape (so the existing reporting/UI works unchanged),
+ * or `null` when there is nothing for the caller to report — search is
+ * disabled, or a failure already emitted its own specific status. An empty
+ * (but non-null) result is a real "ran, found nothing" and is left to the
+ * caller to warn about. Never throws: a search problem never aborts the turn.
+ */
+async function gatherWebContext(
+  opts: AgentOptions,
+  query: string,
+): Promise<{ results: WebSearchResult[]; sources: unknown[] } | null> {
+  let provider: WebSearchProvider | null;
+  try {
+    // `undefined` → resolve from env; explicit `null` disables (tests, opt-out).
+    provider = opts.searchProvider === undefined ? resolveWebSearchProvider() : opts.searchProvider;
+  } catch (err) {
+    // Misconfigured backend (e.g. a selected provider missing its key).
+    opts.events.onStatus?.(`⚠ Web search unavailable: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
+  if (!provider) return null;
+
+  opts.events.onStatus?.(`🔎 Searching the web (${provider.id})…`);
+  try {
+    const results = await provider.search(query, {
+      signal: opts.signal,
+      maxResults: WEB_SEARCH_MAX_RESULTS,
+    });
+    const sources = results.map((result) => ({
+      source: { urls: [result.url] },
+      title: result.title,
+    }));
+    return { results, sources };
+  } catch (err) {
+    opts.events.onStatus?.(`⚠ Web search failed: ${err instanceof Error ? err.message : err}`);
+    return null;
+  }
 }
 const AGENT_ACKNOWLEDGEMENT =
   'Understood. I will act directly with the available tools, create explicitly requested new files, and verify the real result before reporting completion.';
@@ -210,11 +252,18 @@ export interface AgentOptions {
   /** Reply language. Auto follows the language of the latest user message. */
   language?: AgentLanguage;
   /**
-   * Open WebUI web search for this run (`features.web_search`). Off by
-   * default — the Chat Minerva 7B often lacks the capability and search
-   * adds latency even when the server supports it.
+   * Run a client-side web search for this turn and inject the results into
+   * the prompt. Off by default — search adds latency, and a small model does
+   * not always benefit. The backend is chosen by MINERVA_SEARCH_PROVIDER
+   * (DuckDuckGo by default); see ../api/websearch.ts.
    */
   webSearch?: boolean;
+  /**
+   * Overrides the env-resolved search provider. `undefined` resolves from the
+   * environment; explicit `null` disables local search. Primarily a test and
+   * custom-backend seam.
+   */
+  searchProvider?: WebSearchProvider | null;
   /** Self-review applied changes before finishing. Defaults on in auto mode. */
   review?: boolean;
   events: AgentEvents;
@@ -401,9 +450,14 @@ async function runLightChat(
 ): Promise<AgentResult> {
   const instructions = `You are Minerva, a friendly AI assistant for students, chatting in a plain terminal. ${languageInstruction(opts.language)} Answer the student's message directly and concisely.`;
   const history = scrubStaleAssistantFences(opts.history);
+  const web = opts.webSearch ? await gatherWebContext(opts, prompt) : null;
+  if (web) reportWebSearch(opts, web.sources);
+  const userContent = web?.results.length
+    ? `${instructions}\n\n${formatWebResults(prompt, web.results)}\n\nStudent message: ${prompt}`
+    : `${instructions}\n\nStudent message: ${prompt}`;
   const result = await streamChatWithRetry(
     model,
-    [...history, { role: 'user', content: `${instructions}\n\nStudent message: ${prompt}` }],
+    [...history, { role: 'user', content: userContent }],
     opts,
   );
   if (!result.ok) {
@@ -418,7 +472,6 @@ async function runLightChat(
       pendingIntent: opts.pendingIntent ?? null,
     };
   }
-  reportWebSearch(opts, result.sources);
   opts.events.onText(result.text);
   return {
     history: [
@@ -553,12 +606,17 @@ export async function runAgentWithModel(
   const acceptanceRequirements = requiredNewPaths.length
     ? `\n\nHard acceptance requirement: create the exact requested path${requiredNewPaths.length === 1 ? '' : 's'} ${requiredNewPaths.join(', ')}. Do not substitute another filename.${intent.requiresExecution ? ' This is a small standalone program: keep each file under 80 lines, use direct standard-language control flow, and emit the complete file action now before any explanation.' : ''}${requestedCProgram ? ' C/C++ hygiene: use a conventional main entry point, include every standard header you use, keep identifier casing consistent, and prefer small bounded loops and helpers over recursion, variable-length arrays, or pointer tricks.' : ''}`
     : '';
+  // Client-side web search, once per user turn: results are injected into the
+  // turn prompt and reported through the same channel as the old server path.
+  const web = opts.webSearch ? await gatherWebContext(opts, prompt) : null;
+  if (web) reportWebSearch(opts, web.sources);
   const userContent = `${languageInstruction(opts.language)}\n\n${buildTurnPrompt({
     request: prompt,
     repositoryMap: repoMap.map,
     fileContents,
     skippedFiles: skipped,
     initialVerification,
+    webSearch: web?.results.length ? { query: prompt, results: web.results } : undefined,
   })}${acceptanceRequirements}`;
 
   // Old assistant code proposals in history are the model's main
@@ -816,7 +874,6 @@ export async function runAgentWithModel(
       break;
     }
     const response = attempt.text;
-    reportWebSearch(opts, attempt.sources);
     messages.push({ role: 'assistant', content: response });
 
     // The code-block fallback is the primary write path for ChatMinerva —

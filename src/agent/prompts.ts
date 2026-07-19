@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Tool } from '../tools/tool.js';
+import type { WebSearchResult } from '../api/websearch.js';
 import { discoverProjectFiles, isSensitiveProjectFile } from './repo-map.js';
 
 export const PROJECT_CONTEXT_FILE = '.minervacode.md';
@@ -180,14 +181,36 @@ export function formatToolResult(name: string, result: string, ok: boolean): str
   return `<tool_result name="${name}" status="${status}">\n${result}\n</tool_result>`;
 }
 
+/** Chars kept per web snippet — a small model is easily swamped by long
+ *  injected context, so results ride in as terse `[n] title — url` lines. */
+const MAX_WEB_SNIPPET = 200;
+
+/**
+ * Compact web-results block for prompt injection. Deliberately minimal: one
+ * instruction line plus two short lines per result. Feeds a 32k 7B, so no
+ * decorative headers and hard-capped snippets — verbosity here degrades it.
+ */
+export function formatWebResults(query: string, results: WebSearchResult[]): string {
+  const items = results.map((result, index) => {
+    const snippet = result.snippet.replace(/\s+/g, ' ').trim().slice(0, MAX_WEB_SNIPPET);
+    return `[${index + 1}] ${result.title} — ${result.url}${snippet ? `\n${snippet}` : ''}`;
+  });
+  return `Current web results for "${query}" (cite the [n] you use; ignore if irrelevant):\n${items.join('\n')}`;
+}
+
 export function buildTurnPrompt(options: {
   request: string;
   repositoryMap?: string;
   fileContents?: ProjectFile[];
   skippedFiles?: string[];
   initialVerification?: { command: string; output: string };
+  webSearch?: { query: string; results: WebSearchResult[] };
 }): string {
   const sections = [`Student request: ${options.request}`];
+  // Fresh facts sit right after the request so they stay salient for the 7B.
+  if (options.webSearch?.results.length) {
+    sections.push(formatWebResults(options.webSearch.query, options.webSearch.results));
+  }
   if (options.initialVerification) {
     sections.push(
       `Initial verification failed before any changes. Use this real failure as the primary diagnostic and fix the relevant SOURCE file:\n$ ${options.initialVerification.command}\n${options.initialVerification.output}`,
