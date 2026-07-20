@@ -1,0 +1,48 @@
+name: Release
+
+# Manual, one-click releases from the GitHub UI (Actions → Release → Run).
+# Picks a semver bump, runs the test suite as a gate (via the `preversion`
+# npm hook), bumps package.json + package-lock.json, stubs the CHANGELOG,
+# commits, tags `vX.Y.Z`, and pushes the commit and tag back to the branch.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Semver bump to apply
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+
+# The bump commit and tag are pushed with the built-in token.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # `npm version` runs the preversion (test) and version (changelog) hooks,
+      # bumps the manifests, commits, and tags. Then push commit + tag.
+      - name: Bump, tag, and push
+        run: |
+          npm version "${{ inputs.bump }}" -m "Release v%s"
+          git push --follow-tags

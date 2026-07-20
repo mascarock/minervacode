@@ -31,7 +31,12 @@
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "test": "vitest run",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "preversion": "npm test",
+    "version": "node scripts/changelog-stub.mjs && git add CHANGELOG.md",
+    "release": "npm version patch -m \"Release v%s\" && git push --follow-tags",
+    "release:minor": "npm version minor -m \"Release v%s\" && git push --follow-tags",
+    "release:major": "npm version major -m \"Release v%s\" && git push --follow-tags"
   },
   "engines": {
     "node": ">=22.0.0"
